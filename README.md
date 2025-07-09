@@ -1,2 +1,2 @@
 # KUTOC-spot
-This repository contains some programs for spot
+This repository has some programs for spot
