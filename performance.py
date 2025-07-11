@@ -708,29 +708,9 @@ class CommandProcess():
         log_event("音声認識をリセットします")
         reset_audio_recognition()
         return False  # プログラム終了にはつながらない
-            
-    def _make_map(self):
-        try:
-            if self.recording_map == True:
-                log_event("地図作成中: 既に地図作成中です")
-                print("地図作成中です")
-                print("-" * 80)
-                return
-            else:
-                log_event("命令受理: 地図作成開始")
-                print("地図を作成開始します")
-                self.rcl._start_recording()
-                self.recording_map = True
-                update_robot_state(map_recording=True)
-                print("-" * 80)
-        except Exception as e:
-            log_event(f"エラー: {e}")
-            update_robot_state(map_recording=False)
-            print(f"Error occurred: {e}")
-            return
                 
         
-    def _sit_down(self):
+    def _spot_sit_down(self):
         try:
             if self.recording_map == True:
                 print("地図作成中には座れません")
@@ -751,7 +731,7 @@ class CommandProcess():
         finally:
             self.thread_running = False
         
-    def _stand_up(self):
+    def _spot_stand_up(self):
         try:
             if self.recording_map == True:
                 print("地図作成中には立ち上がれません")
@@ -773,7 +753,7 @@ class CommandProcess():
             self.thread_running = False
             
         
-    def _detect_and_follow(self):
+    def _spot_detect_and_follow(self):
         global PROCESS_THREAD, SHUTDOWN_FLAG
         try:
             if PROCESS_THREAD is None or not PROCESS_THREAD.is_alive():
@@ -793,7 +773,7 @@ class CommandProcess():
         finally:
             self.thread_running = False
             
-    def _stop_follow(self):
+    def _spot_stop_follow(self):
         global PROCESS_THREAD
         if PROCESS_THREAD is not None and PROCESS_THREAD.is_alive():
             SHUTDOWN_FLAG.value = 1
@@ -804,7 +784,7 @@ class CommandProcess():
         print("-" * 80)
             
         
-    def _go_to_front(self):
+    def _spot_go_to_front(self):
         global PROCESS_THREAD
         # engine.say("go to front")
         # engine.runAndWait()
@@ -827,7 +807,7 @@ class CommandProcess():
         #     return
         self.thread_running = False
             
-    def _move_front_thread(self):
+    def _spot_move_front_thread(self):
         while self._is_spot_go_front:
             robot_state = self.robot_state_client.get_robot_state()
             mobility_params = create_mobility_params(0.3, 0.5)
@@ -844,7 +824,7 @@ class CommandProcess():
                 self._is_spot_go_front = False
                 return
             
-    def _go_to_back(self):
+    def _spot_go_to_back(self):
         global PROCESS_THREAD
         # engine.say("go to back")
         # engine.runAndWait()
@@ -868,7 +848,7 @@ class CommandProcess():
         
         self.thread_running = False
         
-    def _move_back_thread(self):
+    def _spot_move_back_thread(self):
         while self._is_spot_go_back:
             robot_state = self.robot_state_client.get_robot_state()
             mobility_params = create_mobility_params(0.1, 0.5)
@@ -885,7 +865,7 @@ class CommandProcess():
                 self._is_spot_go_back = False
                 return
             
-    def _go_front_little(self):
+    def _spot_go_front_little(self):
         try:
             log_event("命令受理: 少し前進")
             robot_state = self.robot_state_client.get_robot_state()
@@ -907,7 +887,7 @@ class CommandProcess():
 
         return
     
-    def _go_back_little(self):
+    def _spot_go_back_little(self):
         try:
             log_event("命令受理: 少し後退")
             robot_state = self.robot_state_client.get_robot_state()
@@ -930,7 +910,7 @@ class CommandProcess():
         return
 
     
-    def _go_right_little(self):
+    def _spot_go_right_little(self):
         try:
             log_event("命令受理: 少し右に移動")
             robot_state = self.robot_state_client.get_robot_state()
@@ -952,7 +932,7 @@ class CommandProcess():
 
         return
     
-    def _go_left_little(self):
+    def _spot_go_left_little(self):
         try:
             log_event("命令受理: 少し左に移動")
             robot_state = self.robot_state_client.get_robot_state()
@@ -1019,6 +999,21 @@ class CommandProcess():
         
         time.sleep(3.5)
         self.thread_running = False
+        
+    def _spot_rotate(self):
+        log_event("命令受理: 回転")
+        robot_state = self.robot_state_client.get_robot_state()
+        odom_T_flat_body = get_a_tform_b(robot_state.kinematic_state.transforms_snapshot,
+                                         ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME)
+        # Specify a trajectory to shift the body forward followed by looking down, then return to nominal.
+        # Define times (in seconds) for each point in the trajectory.
+        mobility_params = create_mobility_params(0.75, 0.6)
+        tag_cmd = RobotCommandBuilder.synchro_trajectory_command_in_body_frame(0, 0, math.pi,
+            robot_state.kinematic_state.transforms_snapshot, mobility_params)
+        end_time = 20.0
+        self.robot_command_client.robot_command(lease=None, command=tag_cmd,
+                                        end_time_secs=time.time() + end_time)
+        
         
     def _exit_program(self):
         global PROCESS_THREAD, SHUTDOWN_FLAG
