@@ -14,18 +14,19 @@ import datetime
 import multiprocessing
 import subprocess
 
+from multiprocessing import Process, Queue, Barrier, Value
+from math import sqrt
+
 import cv2
 import numpy as np
 
-from commands_config import get_command_dict, get_keyboard_commands_dict
-
-from multiprocessing import Process, Queue, Barrier, Value
-from math import sqrt
 from vosk import Model, KaldiRecognizer
-
 from ultralytics import YOLO
-
 from flask import Flask, jsonify, render_template, send_from_directory  # 既にimport済み
+
+import src.graph_nav_util as graph_nav_util
+import src.dijkstra as dijkstra
+from src.commands_config import get_command_dict, get_keyboard_commands_dict
 
 import bosdyn.client
 import bosdyn.client.lease
@@ -66,9 +67,13 @@ from bosdyn.client.graph_nav import GraphNavClient
 from bosdyn.client.map_processing import MapProcessingServiceClient
 from bosdyn.client.power import PowerClient
 
-# import Jetson.GPIO as GPIO
+import Jetson.GPIO as GPIO
 
 print("Imported all libraries")
+
+os.environ['BOSDYN_CLIENT_USERNAME'] = "user"
+os.environ['BOSDYN_CLIENT_PASSWORD'] = "vvza0en6qb6m"
+os.environ['GRPC_POLL_STRATEGY'] = "poll"
 
 """Spotのスピード制御"""
 SPEED_LIMIT = 1.2
@@ -80,6 +85,8 @@ SHUTDOWN_FLAG = Value('i', 0)
 PROCESS_THREAD = None
 
 PROCESSED_IMAGE_PATH = "image"
+
+LEASE = None
 
 
 q = multiprocessing.Queue()
@@ -291,6 +298,862 @@ class AsyncRobotState(AsyncPeriodicQuery):
 
     def _start_query(self):
         return self._client.get_robot_state_async()
+    
+class RecordingInterface(object):
+    """Recording service command line interface."""
+
+    def __init__(self, robot, download_filepath, client_metadata, use_gps=False):
+        # Keep the robot instance and it's ID.
+        self._robot = robot
+
+        self.use_gps = use_gps
+
+        # Force trigger timesync.
+        self._robot.time_sync.wait_for_sync()
+
+        # Filepath for the location to put the downloaded graph and snapshots.
+        self._download_filepath = os.path.join(download_filepath, 'downloaded_graph')
+
+        # Set up the recording service client.
+        self._recording_client = self._robot.ensure_client(
+            GraphNavRecordingServiceClient.default_service_name)
+
+        # Create the recording environment.
+        self._recording_environment = GraphNavRecordingServiceClient.make_recording_environment(
+            waypoint_env=GraphNavRecordingServiceClient.make_waypoint_environment(
+                client_metadata=client_metadata))
+
+        # Set up the graph nav service client.
+        self._graph_nav_client = robot.ensure_client(GraphNavClient.default_service_name)
+
+        self._map_processing_client = robot.ensure_client(
+            MapProcessingServiceClient.default_service_name)
+
+        # Store the most recent knowledge of the state of the robot based on rpc calls.
+        self._current_graph = None
+        self._current_edges = dict()  #maps to_waypoint to list(from_waypoint)
+        self._current_waypoint_snapshots = dict()  # maps id to waypoint snapshot
+        self._current_edge_snapshots = dict()  # maps id to edge snapshot
+        self._current_annotation_name_to_wp_id = dict()
+        
+        # いくつでもwaypointを作成できるようにカウントする
+        self._count = 1
+        
+        self._create_waypoint_name = ["pointA", "pointB", "pointC"]
+
+
+    def should_we_start_recording(self):
+        # Before starting to record, check the state of the GraphNav system.
+        graph = self._graph_nav_client.download_graph()
+        if graph is not None:
+            # Check that the graph has waypoints. If it does, then we need to be localized to the graph
+            # before starting to record
+            if len(graph.waypoints) > 0:
+                localization_state = self._graph_nav_client.get_localization_state()
+                if not localization_state.localization.waypoint_id:
+                    # Not localized to anything in the map. The best option is to clear the graph or
+                    # attempt to localize to the current map.
+                    # Returning false since the GraphNav system is not in the state it should be to
+                    # begin recording.
+                    return False
+        # If there is no graph or there exists a graph that we are localized to, then it is fine to
+        # start recording, so we return True.
+        return True
+
+    def _clear_map(self, *args):
+        """Clear the state of the map on the robot, removing all waypoints and edges."""
+        return self._graph_nav_client.clear_graph()
+
+    def _start_recording(self, *args):
+        """Start recording a map."""
+        should_start_recording = self.should_we_start_recording()
+        if not should_start_recording:
+            print('The system is not in the proper state to start recording.'
+                  'Try using the graph_nav_command_line to either clear the map or'
+                  'attempt to localize to the map.')
+            return
+        try:
+            status = self._recording_client.start_recording(
+                recording_environment=self._recording_environment)
+            print('Successfully started recording a map.')
+        except Exception as err:
+            print(f'Start recording failed: {err}')
+
+    def _stop_recording(self, *args):
+        """Stop or pause recording a map."""
+        first_iter = True
+        while True:
+            try:
+                status = self._recording_client.stop_recording()
+                print('Successfully stopped recording a map.')
+                break
+            except bosdyn.client.recording.NotReadyYetError as err:
+                # It is possible that we are not finished recording yet due to
+                # background processing. Try again every 1 second.
+                if first_iter:
+                    print('Cleaning up recording...')
+                first_iter = False
+                time.sleep(1.0)
+                continue
+            except Exception as err:
+                print(f'Stop recording failed: {err}')
+                break
+
+    def _get_recording_status(self, *args):
+        """Get the recording service's status."""
+        status = self._recording_client.get_record_status()
+        if status.is_recording:
+            print('The recording service is on.')
+        else:
+            print('The recording service is off.')
+
+    def _create_default_waypoint(self, *args):
+        """Create a default waypoint at the robot's current location."""
+        resp = self._recording_client.create_waypoint(waypoint_name='created_user_waypoint' + str(self._count))
+        if resp.status == recording_pb2.CreateWaypointResponse.STATUS_OK:
+            print('Successfully created a waypoint.')
+        else:
+            print('Could not create a waypoint.')
+            
+    def _create_default_waypoint_odm(self, *args):
+        """オドメトリを使ってwaypointを作成する"""
+        resp = self._recording_client.create_waypoint(waypoint_name='odm_waypoint' + str(self._count))
+        if resp.status == recording_pb2.CreateWaypointResponse.STATUS_OK:
+            print('Successfully created a waypoint.')
+            self._count += 1
+        else:
+            print('Could not create a waypoint.')
+
+    def _download_full_graph(self, *args):
+        """Download the graph and snapshots from the robot."""
+        graph = self._graph_nav_client.download_graph()
+        if graph is None:
+            print('Failed to download the graph.')
+            return
+        self._write_full_graph(graph)
+        print(
+            f'Graph downloaded with {len(graph.waypoints)} waypoints and {len(graph.edges)} edges')
+        # Download the waypoint and edge snapshots.
+        self._download_and_write_waypoint_snapshots(graph.waypoints)
+        self._download_and_write_edge_snapshots(graph.edges)
+
+    def _write_full_graph(self, graph):
+        """Download the graph from robot to the specified, local filepath location."""
+        graph_bytes = graph.SerializeToString()
+        self._write_bytes(self._download_filepath, 'graph', graph_bytes)
+
+    def _download_and_write_waypoint_snapshots(self, waypoints):
+        """Download the waypoint snapshots from robot to the specified, local filepath location."""
+        num_waypoint_snapshots_downloaded = 0
+        for waypoint in waypoints:
+            if len(waypoint.snapshot_id) == 0:
+                continue
+            try:
+                waypoint_snapshot = self._graph_nav_client.download_waypoint_snapshot(
+                    waypoint.snapshot_id)
+            except Exception:
+                # Failure in downloading waypoint snapshot. Continue to next snapshot.
+                print(f'Failed to download waypoint snapshot: {waypoint.snapshot_id}')
+                continue
+            self._write_bytes(os.path.join(self._download_filepath, 'waypoint_snapshots'),
+                              str(waypoint.snapshot_id), waypoint_snapshot.SerializeToString())
+            num_waypoint_snapshots_downloaded += 1
+            print(
+                f'Downloaded {num_waypoint_snapshots_downloaded} of the total {len(waypoints)} waypoint snapshots.'
+            )
+
+    def _download_and_write_edge_snapshots(self, edges):
+        """Download the edge snapshots from robot to the specified, local filepath location."""
+        num_edge_snapshots_downloaded = 0
+        num_to_download = 0
+        for edge in edges:
+            if len(edge.snapshot_id) == 0:
+                continue
+            num_to_download += 1
+            try:
+                edge_snapshot = self._graph_nav_client.download_edge_snapshot(edge.snapshot_id)
+            except Exception:
+                # Failure in downloading edge snapshot. Continue to next snapshot.
+                print(f'Failed to download edge snapshot: {edge.snapshot_id}')
+                continue
+            self._write_bytes(os.path.join(self._download_filepath, 'edge_snapshots'),
+                              str(edge.snapshot_id), edge_snapshot.SerializeToString())
+            num_edge_snapshots_downloaded += 1
+            print(
+                f'Downloaded {num_edge_snapshots_downloaded} of the total {num_to_download} edge snapshots.'
+            )
+
+    def _write_bytes(self, filepath, filename, data):
+        """Write data to a file."""
+        os.makedirs(filepath, exist_ok=True)
+        with open(os.path.join(filepath, filename), 'wb+') as f:
+            f.write(data)
+            f.close()
+
+    def _update_graph_waypoint_and_edge_ids(self, do_print=False):
+        # Download current graph
+        graph = self._graph_nav_client.download_graph()
+        if graph is None:
+            print('Empty graph.')
+            return
+        self._current_graph = graph
+
+        localization_id = self._graph_nav_client.get_localization_state().localization.waypoint_id
+
+        # Update and print waypoints and edges
+        self._current_annotation_name_to_wp_id, self._current_edges = graph_nav_util.update_waypoints_and_edges(
+            graph, localization_id, do_print)
+
+    def _list_graph_waypoint_and_edge_ids(self, *args):
+        """List the waypoint ids and edge ids of the graph currently on the robot."""
+        self._update_graph_waypoint_and_edge_ids(do_print=True)
+
+    def _create_new_edge(self, *args):
+        """Create new edge between existing waypoints in map."""
+
+        if len(args[0]) != 2:
+            print('ERROR: Specify the two waypoints to connect (short code or annotation).')
+            return
+
+        self._update_graph_waypoint_and_edge_ids(do_print=False)
+
+        from_id = graph_nav_util.find_unique_waypoint_id(args[0][0], self._current_graph,
+                                                         self._current_annotation_name_to_wp_id)
+        to_id = graph_nav_util.find_unique_waypoint_id(args[0][1], self._current_graph,
+                                                       self._current_annotation_name_to_wp_id)
+
+        print(f'Creating edge from {from_id} to {to_id}.')
+
+        from_wp = self._get_waypoint(from_id)
+        if from_wp is None:
+            return
+
+        to_wp = self._get_waypoint(to_id)
+        if to_wp is None:
+            return
+
+        # Get edge transform based on kinematic odometry
+        edge_transform = self._get_transform(from_wp, to_wp)
+
+        # Define new edge
+        new_edge = map_pb2.Edge()
+        new_edge.id.from_waypoint = from_id
+        new_edge.id.to_waypoint = to_id
+        new_edge.from_tform_to.CopyFrom(edge_transform)
+
+        print(f'edge transform = {new_edge.from_tform_to}')
+
+        # Send request to add edge to map
+        self._recording_client.create_edge(edge=new_edge)
+        
+    def _auto_close_loops(self, close_fiducial_loops, close_odometry_loops, *args):
+        """Automatically find and close all loops in the graph."""
+        response = self._map_processing_client.process_topology(
+            params=map_processing_pb2.ProcessTopologyRequest.Params(
+                do_fiducial_loop_closure=wrappers.BoolValue(value=close_fiducial_loops),
+                do_odometry_loop_closure=wrappers.BoolValue(value=close_odometry_loops)),
+            modify_map_on_server=True)
+        print(f'Created {len(response.new_subgraph.edges)} new edge(s).')
+        log_event(f'Created {len(response.new_subgraph.edges)} new edge(s).')
+    
+
+class GraphNavInterface(object):
+    """GraphNav service command line interface."""
+
+    def __init__(self, robot, upload_path, use_gps=False):
+        self._robot = robot
+        self.use_gps = use_gps
+
+        # Force trigger timesync.
+        self._robot.time_sync.wait_for_sync()
+
+        # Create robot state and command clients.
+        self._robot_command_client = self._robot.ensure_client(
+            RobotCommandClient.default_service_name)
+        self._robot_state_client = self._robot.ensure_client(RobotStateClient.default_service_name)
+
+        # Create the client for the Graph Nav main service.
+        self._graph_nav_client = self._robot.ensure_client(GraphNavClient.default_service_name)
+
+        # Create a power client for the robot.
+        self._power_client = self._robot.ensure_client(PowerClient.default_service_name)
+
+        # Boolean indicating the robot's power state.
+        power_state = self._robot_state_client.get_robot_state().power_state
+        self._started_powered_on = (power_state.motor_power_state == power_state.STATE_ON)
+        self._powered_on = self._started_powered_on
+
+        # Number of attempts to wait before trying to re-power on.
+        self._max_attempts_to_wait = 50
+
+        # Store the most recent knowledge of the state of the robot based on rpc calls.
+        self._current_graph = None
+        self._current_edges = dict()  #maps to_waypoint to list(from_waypoint)
+        self._current_waypoint_snapshots = dict()  # maps id to waypoint snapshot
+        self._current_edge_snapshots = dict()  # maps id to edge snapshot
+        self._current_annotation_name_to_wp_id = dict()
+        
+        
+        # waypointをidを格納する配列
+        self._waypoint_all_id = []
+        self._waypoint_all_name = []
+        
+        # 自動運転を制御するためのブール変数
+        self._is_finished = True
+        
+        # マップはspotにアップロードされたか
+        self._is_uploaded = False
+        
+        self._is_autodrive_cancel = False
+
+        # Filepath for uploading a saved graph's and snapshots too.
+        if upload_path[-1] == '/':
+            self._upload_filepath = upload_path[:-1]
+        else:
+            self._upload_filepath = upload_path
+
+        if self.use_gps:
+            self._command_dictionary['g'] = self._navigate_to_gps_coords
+            
+    
+
+    def _get_localization_state(self, *args):
+        """Get the current localization and state of the robot."""
+        state = self._graph_nav_client.get_localization_state(request_gps_state=self.use_gps)
+        print(f'Got localization: \n{state.localization}')
+        odom_tform_body = get_odom_tform_body(state.robot_kinematics.transforms_snapshot)
+        print(f'Got robot state in kinematic odometry frame: \n{odom_tform_body}')
+        if self.use_gps:
+            print(f'GPS info:\n{state.gps}')
+
+    def _set_initial_localization_fiducial(self, *args):
+        """Trigger localization when near a fiducial."""
+        robot_state = self._robot_state_client.get_robot_state()
+        current_odom_tform_body = get_odom_tform_body(
+            robot_state.kinematic_state.transforms_snapshot).to_proto()
+        # Create an empty instance for initial localization since we are asking it to localize
+        # based on the nearest fiducial.
+        localization = nav_pb2.Localization()
+        self._graph_nav_client.set_localization(initial_guess_localization=localization,
+                                                ko_tform_body=current_odom_tform_body)
+
+
+    def _set_initial_localization_waypoint(self, *args):
+        """Trigger localization to a waypoint."""
+        # Take the first argument as the localization waypoint.
+        if len(args) < 1:
+            # If no waypoint id is given as input, then return without initializing.
+            print('No waypoint specified to initialize to.')
+            return
+        destination_waypoint = graph_nav_util.find_unique_waypoint_id(
+            args[0][0], self._current_graph, self._current_annotation_name_to_wp_id)
+        if not destination_waypoint:
+            # Failed to find the unique waypoint id.
+            return
+
+        robot_state = self._robot_state_client.get_robot_state()
+        current_odom_tform_body = get_odom_tform_body(
+            robot_state.kinematic_state.transforms_snapshot).to_proto()
+        # Create an initial localization to the specified waypoint as the identity.
+        localization = nav_pb2.Localization()
+        localization.waypoint_id = destination_waypoint
+        localization.waypoint_tform_body.rotation.w = 1.0
+        self._graph_nav_client.set_localization(
+            initial_guess_localization=localization,
+            # It's hard to get the pose perfect, search +/-20 deg and +/-20cm (0.2m).
+            max_distance=0.2,
+            max_yaw=20.0 * math.pi / 180.0,
+            fiducial_init=graph_nav_pb2.SetLocalizationRequest.FIDUCIAL_INIT_NO_FIDUCIAL,
+            ko_tform_body=current_odom_tform_body)
+        
+    def _get_localication_id(self):
+        """現在、経路のどこにいるか（一番近くのwaypointを見つける）"""
+
+        # Download current graph
+        graph = self._graph_nav_client.download_graph()
+        if graph is None:
+            print('Empty graph.')
+            return None, None, None
+        self._current_graph = graph
+
+        localization_id = self._graph_nav_client.get_localization_state().localization.waypoint_id
+        
+        for i in range(len(self._waypoint_all_id)):
+            if self._waypoint_all_id[i] == localization_id:
+                # print(f"現在のwaypointは{self._waypoint_all_name[i]}です")
+                localization_name = self._waypoint_all_name[i]
+                break
+        
+        print("現在のwaypoint_idは", localization_id)
+        
+        return localization_id, localization_name, i
+
+    def _list_graph_waypoint_and_edge_ids(self, *args):
+        """List the waypoint ids and edge ids of the graph currently on the robot."""
+
+        # Download current graph
+        graph = self._graph_nav_client.download_graph()
+        if graph is None:
+            print('Empty graph.')
+            return
+        self._current_graph = graph
+
+        localization_id = self._graph_nav_client.get_localization_state().localization.waypoint_id
+
+        # Update and print waypoints and edges
+        # self._current_annotation_name_to_wp_id, self._current_edges = graph_nav_util.update_waypoints_and_edges(
+        #     graph, localization_id)
+        
+        # 作成順に並び替える（みつき作）
+        self._current_annotation_name_to_wp_id, self._current_edges, self._waypoint_all_id, self._waypoint_all_name = graph_nav_util.update_waypoints_and_edges(
+            graph, localization_id)
+        
+        print("waypointをidを出力します")
+        for i in range(len(self._waypoint_all_id)):
+            print(self._waypoint_all_id[i])
+            
+        print("waypointを名前を出力します")
+        for i in range(len(self._waypoint_all_name)):
+            print(self._waypoint_all_name[i])
+            
+        self._is_uploaded = True
+        
+    
+    def _get_user_waypoint(self):
+        
+        # 作成したウェイポイントを探す
+        # 作成していないと見つからない
+        # 一番最後に作成したwaypointを探すようにしているはず
+        if self._is_uploaded == False:
+            print("マップがアップロードされていません")
+            return None, None, None
+        max_id = -1  # 最大の数値部分を保持する変数
+        max_waypoint = None  # 最大のウェイポイント名を保持する変数
+        max_index = -1  # 最大のウェイポイントのインデックスを保持する変数
+
+        for i in range(len(self._waypoint_all_id)):
+            if "created_user_waypoint" in self._waypoint_all_name[i]:
+                # ウェイポイント名から数字部分を抽出
+                number_part = self._waypoint_all_name[i][len("created_user_waypoint"):]
+
+                try:
+                    number_value = int(number_part)  # 数値に変換
+                    if number_value > max_id:  # 最大値を更新
+                        max_id = number_value
+                        max_waypoint = self._waypoint_all_name[i]
+                        max_index = i
+                except ValueError:
+                    # 数値変換に失敗した場合は無視
+                    continue
+
+        if max_waypoint is not None:
+            print(f"{max_waypoint}: {self._waypoint_all_id[max_index]}")
+            return max_waypoint, self._waypoint_all_id[max_index], max_index
+
+        print("ユーザが作成したウェイポイントが見つかりません")
+        return None, None, None
+            
+
+    def _upload_graph_and_snapshots(self, *args):
+        """Upload the graph and snapshots to the robot."""
+        print('Loading the graph from disk into local storage...')
+        with open(self._upload_filepath + '/graph', 'rb') as graph_file:
+            # Load the graph from disk.
+            data = graph_file.read()
+            self._current_graph = map_pb2.Graph()
+            self._current_graph.ParseFromString(data)
+            print(
+                f'Loaded graph has {len(self._current_graph.waypoints)} waypoints and {self._current_graph.edges} edges'
+            )
+        for waypoint in self._current_graph.waypoints:
+            # Load the waypoint snapshots from disk.
+            with open(f'{self._upload_filepath}/waypoint_snapshots/{waypoint.snapshot_id}',
+                      'rb') as snapshot_file:
+                waypoint_snapshot = map_pb2.WaypointSnapshot()
+                waypoint_snapshot.ParseFromString(snapshot_file.read())
+                self._current_waypoint_snapshots[waypoint_snapshot.id] = waypoint_snapshot
+        for edge in self._current_graph.edges:
+            if len(edge.snapshot_id) == 0:
+                continue
+            # Load the edge snapshots from disk.
+            with open(f'{self._upload_filepath}/edge_snapshots/{edge.snapshot_id}',
+                      'rb') as snapshot_file:
+                edge_snapshot = map_pb2.EdgeSnapshot()
+                edge_snapshot.ParseFromString(snapshot_file.read())
+                self._current_edge_snapshots[edge_snapshot.id] = edge_snapshot
+        # Upload the graph to the robot.
+        print('Uploading the graph and snapshots to the robot...')
+        true_if_empty = not len(self._current_graph.anchoring.anchors)
+        response = self._graph_nav_client.upload_graph(graph=self._current_graph,
+                                                       generate_new_anchoring=true_if_empty)
+        # Upload the snapshots to the robot.
+        for snapshot_id in response.unknown_waypoint_snapshot_ids:
+            waypoint_snapshot = self._current_waypoint_snapshots[snapshot_id]
+            self._graph_nav_client.upload_waypoint_snapshot(waypoint_snapshot)
+            print(f'Uploaded {waypoint_snapshot.id}')
+        for snapshot_id in response.unknown_edge_snapshot_ids:
+            edge_snapshot = self._current_edge_snapshots[snapshot_id]
+            self._graph_nav_client.upload_edge_snapshot(edge_snapshot)
+            print(f'Uploaded {edge_snapshot.id}')
+
+        # The upload is complete! Check that the robot is localized to the graph,
+        # and if it is not, prompt the user to localize the robot before attempting
+        # any navigation commands.
+        localization_state = self._graph_nav_client.get_localization_state()
+        if not localization_state.localization.waypoint_id:
+            # The robot is not localized to the newly uploaded graph.
+            print('\n')
+            print(
+                'Upload complete! The robot is currently not localized to the map; please localize'
+                ' the robot using commands (2) or (3) before attempting a navigation command.')
+
+
+
+    def _navigate_to(self, *args):
+        """Navigate to a specific waypoint."""
+        # Take the first argument as the destination waypoint.
+        if len(args) < 1:
+            # If no waypoint id is given as input, then return without requesting navigation.
+            print('No waypoint provided as a destination for navigate to.')
+            return
+
+        destination_waypoint = graph_nav_util.find_unique_waypoint_id(
+            args[0][0], self._current_graph, self._current_annotation_name_to_wp_id)
+        if not destination_waypoint:
+            # Failed to find the appropriate unique waypoint id for the navigation command.
+            return
+        if not self.toggle_power(should_power_on=True):
+            print('Failed to power on the robot, and cannot complete navigate to request.')
+            return
+
+        nav_to_cmd_id = None
+        # Navigate to the destination waypoint.
+        self._is_finished = False
+        while not self._is_finished:
+            # Issue the navigation command about twice a second such that it is easy to terminate the
+            # navigation command (with estop or killing the program).
+            try:
+                nav_to_cmd_id = self._graph_nav_client.navigate_to(destination_waypoint, 1.0,
+                                                                   command_id=nav_to_cmd_id)
+            except ResponseError as e:
+                print(f'Error while navigating {e}')
+                break
+            time.sleep(.5)  # Sleep for half a second to allow for command execution.
+            # Poll the robot for feedback to determine if the navigation command is complete. Then sit
+            # the robot down once it is finished.
+            self._is_finished = self._check_success(nav_to_cmd_id)
+
+        # Power off the robot if appropriate.
+        if self._powered_on and not self._started_powered_on:
+            # Sit the robot down + power off after the navigation command is complete.
+            self.toggle_power(should_power_on=False)
+            
+    def _navigate_first_waypoint(self, *args):
+        # 移動先のwaypointを指定する
+        destination_waypoint = args[0]
+        print("destination_waypoint", destination_waypoint)
+        
+        if not destination_waypoint:
+            print("waypointが記録されていない可能性があります")
+            return
+        
+        nav_to_cmd_id = None
+        # Navigate to the destination waypoint.
+        self._is_finished = False
+        while not self._is_finished:
+            # Issue the navigation command about twice a second such that it is easy to terminate the
+            # navigation command (with estop or killing the program).
+            try:
+                nav_to_cmd_id = self._graph_nav_client.navigate_to(destination_waypoint, 1.0,
+                                                                   command_id=nav_to_cmd_id)
+            except ResponseError as e:
+                print(f'Error while navigating {e}')
+                break
+            time.sleep(.5)  # Sleep for half a second to allow for command execution.
+            # Poll the robot for feedback to determine if the navigation command is complete. Then sit
+            # the robot down once it is finished.
+            self._is_finished = self._check_success(nav_to_cmd_id)
+        print("waypointに到着しました")
+        log_event("waypointに到着しました")
+        # engine.say("arrived at the waypoint")
+        # engine.runAndWait()
+        # voice_output("arrived at the waypoint")
+        print("-" * 80)
+
+    def _navigate_route(self, *args):
+        
+        speed_x = 0.6 * SPEED_LIMIT
+        speed_y = 1.0 * SPEED_LIMIT
+        speed_angle = 0.5 * SPEED_LIMIT
+
+        # 速度の設定
+        speed_limit = geo.SE2VelocityLimit(
+        max_vel=geo.SE2Velocity(
+        linear=geo.Vec2(x=speed_x, y=speed_y),
+        angular=speed_angle))
+        print("確認1")
+        
+        params = self._graph_nav_client.generate_travel_params(
+        max_distance = 0.5, max_yaw = 0.5, velocity_limit = speed_limit)
+
+        print("確認2")
+        
+        waypoint_ids = self._waypoint_all_id
+        for i in range(len(waypoint_ids)):
+            print("before waypoint_ids[i]", waypoint_ids[i])
+            waypoint_ids[i] = graph_nav_util.find_unique_waypoint_id(
+                waypoint_ids[i], self._current_graph, self._current_annotation_name_to_wp_id)
+            if not waypoint_ids[i]:
+                # Failed to find the unique waypoint id.
+                return
+            print("after waypoint_ids[i]", waypoint_ids[i])
+            
+        edge_ids_list = []
+        
+        print("確認3")
+        for i in range(len(waypoint_ids) - 1):
+            start_wp = waypoint_ids[i]
+            end_wp = waypoint_ids[i + 1]
+            edge_id = self._match_edge(self._current_edges, start_wp, end_wp)
+            if edge_id is not None:
+                edge_ids_list.append(edge_id)
+            else:
+                all_edges_found = False
+                print(f'Failed to find an edge between waypoints: {start_wp} and {end_wp}')
+                print(
+                    'List the graph\'s waypoints and edges to ensure pairs of waypoints has an edge.'
+                )
+                break
+            
+            
+        route = self._graph_nav_client.build_route(waypoint_ids, edge_ids_list)
+        self._is_finished = False
+        previous_waypoint = None
+        print("確認4")
+        while not self._is_finished:
+            try:
+                nav_route_command_id = self._graph_nav_client.navigate_route(
+                    route, cmd_duration=1.0, travel_params = params)
+
+                # 終点に到達したかの確認
+                self._is_finished = self._check_success(nav_route_command_id)
+                
+                if (self._is_finished):
+                    print("終点に到達しました")
+                    # engine.say("arrived at the end point")
+                    # engine.runAndWait()
+                    # voice_output("arrived at the end point")
+                    print("-" * 80)
+                    break
+                    
+                
+            except ResponseError as e:
+                break
+
+            
+            
+    def _navigate_route_to_user_waypoint(self, current, current_waypoint_id, goal, goal_waypoint_id):
+        # ユーザーが設定したwaypointに移動する
+        
+        # self.rcl._download_full_graph()
+        graph = self._graph_nav_client.download_graph()
+        if graph is None:
+            print('Empty graph.')
+            return
+        self._current_graph = graph
+        
+        minrootgraph = dijkstra.MinRootGraph()
+        
+        # 入力データの作成
+        graph_waypoints = []
+        graph_edges = []
+        
+        print("確認1")
+        for waipoint in range(len(self._current_graph.waypoints)):
+            graph_dict = {
+                "id": self._current_graph.waypoints[waipoint].id,
+                "position": self._current_graph.waypoints[waipoint].waypoint_tform_ko.position,
+                "name": self._current_graph.waypoints[waipoint].annotations.name
+            }
+            graph_waypoints.append(graph_dict)
+            
+        print("確認2")
+            
+        for edge in range(len(self._current_graph.edges)):
+            value = self._current_graph.edges[edge].annotations.cost
+            x = self._current_graph.edges[edge].from_tform_to.position.x
+            y = self._current_graph.edges[edge].from_tform_to.position.y
+            z = self._current_graph.edges[edge].from_tform_to.position.z
+            
+            position = sqrt(x**2 + y**2 + z**2)
+            
+            if hasattr(value, "value"):
+                cost = float(value.value)
+            else:
+                cost = float(value)
+            graph_dict = {
+                "from_waypoint": self._current_graph.edges[edge].id.from_waypoint,
+                "to_waypoint": self._current_graph.edges[edge].id.to_waypoint,
+                "position": position,
+            }
+            print(graph_dict)
+            graph_edges.append(graph_dict)
+
+        print("確認3")
+            
+        for wayopint in range(len(graph_waypoints)):
+            minrootgraph.add_waypoint(self._current_graph.waypoints[wayopint].id)
+            
+        for edge in range(len(self._current_graph.edges)):
+            minrootgraph.add_edge(self._current_graph.edges[edge].id.from_waypoint, self._current_graph.edges[edge].id.to_waypoint, self._current_graph.edges[edge].annotations.cost)
+
+        start_wp_id = current_waypoint_id
+        goal_wp_id = goal_waypoint_id
+        
+        distances, path = minrootgraph.dijkstra(start_wp_id)
+        
+        print("確認4")
+        def get_path(paths, start, end):
+            path = []
+            while end != start:
+                path.append(end)
+                end = paths[end]
+            path.append(start)
+            return path[::-1]
+        
+        shortest_path = get_path(path, start_wp_id, goal_wp_id)
+        
+        waypoint_route = [] 
+        print("確認5")
+        for i in range(len(shortest_path)):
+            shortest_path[i] = graph_nav_util.find_unique_waypoint_id(
+                shortest_path[i], self._current_graph, self._current_annotation_name_to_wp_id)
+            if not shortest_path[i]:
+                # Failed to find the unique waypoint id.
+                return
+            waypoint_route.append(shortest_path[i])
+            
+        edge_ids_list = []
+        for i in range(len(waypoint_route) - 1):
+            start_wp = waypoint_route[i]
+            end_wp = waypoint_route[i + 1]
+            edge_id = self._match_edge(self._current_edges, start_wp, end_wp)
+            if edge_id is not None:
+                edge_ids_list.append(edge_id)
+            else:
+                all_edges_found = False
+                print(f'Failed to find an edge between waypoints: {start_wp} and {end_wp}')
+                print(
+                    'List the graph\'s waypoints and edges to ensure pairs of waypoints has an edge.'
+                )
+                break
+        print("確認6")
+        
+        speed_x = 0.6 * SPEED_LIMIT
+        speed_y = 1.0 * SPEED_LIMIT
+        speed_angle = 0.5 * SPEED_LIMIT
+
+        speed_limit = geo.SE2VelocityLimit(
+        max_vel=geo.SE2Velocity(
+        linear=geo.Vec2(x=speed_x, y=speed_y),
+        angular=speed_angle))
+        
+        params = self._graph_nav_client.generate_travel_params(
+        max_distance = 0.5, max_yaw = 0.5, velocity_limit = speed_limit)
+
+            
+        route = self._graph_nav_client.build_route(waypoint_route, edge_ids_list)
+        self._is_finished = False
+        self._is_autodrive_cancel = False
+        
+        while not self._is_finished:
+            try:
+                nav_route_command_id = self._graph_nav_client.navigate_route(
+                    route, cmd_duration=1.4, travel_params = params)
+
+                # 終点に到達したかの確認
+                self._is_finished = self._check_success(nav_route_command_id)
+                if (self._is_finished):
+                    # engine.say("arrive at the goal")
+                    # engine.runAndWait()
+                    print("arrive at the goal")
+                    log_event("到着しました")
+                    print("-" * 80)
+                    # voice_output("arrive at the goal")
+                    
+                    try:
+                        self._set_initial_localization_fiducial()
+                    except Exception as e:
+                        print(f'failed initialize {e}')
+                    print("-" * 80)
+                    
+                    break
+                
+                # 自動運転がキャンセルされたときの処理
+                if (self._is_autodrive_cancel):
+                    print("自動運転をキャンセルしました")
+                    # engine.say("cancel auto drive")
+                    # engine.runAndWait()
+                    print("-" * 80)
+                    try:
+                        self._set_initial_localization_fiducial()
+                    except Exception as e:
+                        print(f'failed initialize {e}')
+                    print("-" * 80)
+                    
+                    self._is_finished = True
+                    
+                    break
+                
+            except ResponseError as e:
+                self._is_finished = True
+                print("-" * 80)
+                break
+        
+            
+            
+    def _check_success(self, command_id=-1):
+        """Use a navigation command id to get feedback from the robot and sit when command succeeds."""
+        if command_id == -1:
+            # No command, so we have no status to check.
+            return False
+        status = self._graph_nav_client.navigation_feedback(command_id)
+        if status.status == graph_nav_pb2.NavigationFeedbackResponse.STATUS_REACHED_GOAL:
+            # Successfully completed the navigation commands!
+            return True
+        elif status.status == graph_nav_pb2.NavigationFeedbackResponse.STATUS_LOST:
+            print('Robot got lost when navigating the route, the robot will now sit down.')
+            return True
+        elif status.status == graph_nav_pb2.NavigationFeedbackResponse.STATUS_STUCK:
+            print('Robot got stuck when navigating the route, the robot will now sit down.')
+            return True
+        elif status.status == graph_nav_pb2.NavigationFeedbackResponse.STATUS_ROBOT_IMPAIRED:
+            print('Robot is impaired.')
+            return True
+        else:
+            # Navigation command is not complete yet.
+            return False
+        
+            
+        
+            
+    def _match_edge(self, current_edges, waypoint1, waypoint2):
+        """Find an edge in the graph that is between two waypoint ids."""
+        # Return the correct edge id as soon as it's found.
+        for edge_to_id in current_edges:
+            for edge_from_id in current_edges[edge_to_id]:
+                if (waypoint1 == edge_to_id) and (waypoint2 == edge_from_id):
+                    # This edge matches the pair of waypoints! Add it the edge list and continue.
+                    return map_pb2.Edge.Id(from_waypoint=waypoint2, to_waypoint=waypoint1)
+                elif (waypoint2 == edge_to_id) and (waypoint1 == edge_from_id):
+                    # This edge matches the pair of waypoints! Add it the edge list and continue.
+                    return map_pb2.Edge.Id(from_waypoint=waypoint1, to_waypoint=waypoint2)
+        return None
+
+    def _clear_graph(self, *args):
+        """Clear the state of the map on the robot, removing all waypoints and edges."""
+        return self._graph_nav_client.clear_graph()
+    
 
 def set_default_body_control():
     """Set default body control params to current body position"""
@@ -639,6 +1502,11 @@ def update():
     capture_url = get_latest_capture_url() if tracking_state else "/captures/black.jpg"
     return jsonify(state=current_state, logs=log_messages, capture=capture_url)
 
+@app.route("/getlease")
+def get_lease():
+    LEASE.take()
+    return jsonify(success=True)
+
 def log_event(message):
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_line = f"{timestamp} : {message}"
@@ -686,7 +1554,17 @@ def update_robot_state(*, tracking=False, map_recording=False, going_save=False,
 
 class CommandProcess():
     
-    def __init__(self, robot, robot_state_client, robot_command_client):
+    def __init__(self, robot, client_meta_data, robot_state_client, robot_command_client):
+        
+        
+        """
+        rcl ... RecordingInterfaceのインスタンス
+        gcl ... GraphNavInterfaceのインスタンス
+        
+        """
+        
+        self.rcl = RecordingInterface(robot, os.getcwd(), client_meta_data, False)
+        self.gcl = GraphNavInterface(robot, "downloaded_graph", False)
 
         self.robot_state_client = robot_state_client
         self.robot_command_client = robot_command_client
@@ -704,13 +1582,245 @@ class CommandProcess():
         self._is_spot_go_front = False
         self._is_spot_go_back = False
         
+        
+        self.spot_moving_command = {
+            "ついてきて", "着いてきて",
+            "スタート", "戻れ", "戻って", "ナビゲート", "保存場所", "トラック",
+        }
+        
+        self.command_dict = get_command_dict(self)
+        
+        self.keyboard_command_dict = get_keyboard_commands_dict(self)
+        
+        
+    def _execute_command(self, command):
+        # if self.thread_running and command not in the allowed_command:
+        #     print("他のコマンドを実行中です")
+        #     return
+        
+        if command in self.allowed_command:
+            self.thread_running = False
+            self.command_dict[command]()
+            return
+        
+        if command in self.command_dict:
+            self.thread_running = True
+            self.current_thread = threading.Thread(target=self.command_dict[command], daemon=True)
+            self.current_thread.start()
+            return
+        
     def _reset_audio(self):
         log_event("音声認識をリセットします")
         reset_audio_recognition()
         return False  # プログラム終了にはつながらない
-                
+            
+    def _make_map(self):
+        try:
+            if self.recording_map == True:
+                log_event("地図作成中: 既に地図作成中です")
+                print("地図作成中です")
+                print("-" * 80)
+                return
+            else:
+                log_event("命令受理: 地図作成開始")
+                print("地図を作成開始します")
+                self.rcl._start_recording()
+                self.recording_map = True
+                update_robot_state(map_recording=True)
+                print("-" * 80)
+        except Exception as e:
+            log_event(f"エラー: {e}")
+            update_robot_state(map_recording=False)
+            print(f"Error occurred: {e}")
+            return
         
-    def _spot_sit_down(self):
+    def _take_odm_current_and_create_waypoint(self):
+        
+        initial_robot_state = self.robot_state_client.get_robot_state()
+        initial_pose = get_a_tform_b(initial_robot_state.kinematic_state.transforms_snapshot,
+                                 ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME).position
+        
+        prev_x, prev_y, prev_z = initial_pose.x, initial_pose.y, initial_pose.z
+        
+        # self.waypoints = []
+        while self.recording_map:
+            try:
+                current_robot_state = self.robot_state_client.get_robot_state()
+                current_pose = get_a_tform_b(current_robot_state.kinematic_state.transforms_snapshot,
+                                    ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME).position
+                    
+                curr_x, curr_y, curr_z = current_pose.x, current_pose.y, current_pose.z
+                    
+                distance = math.sqrt((curr_x - prev_x) ** 2 + (curr_y - prev_y) ** 2 + (curr_z - prev_z) ** 2)
+                    
+                if distance >= 1.0:
+                    prev_x, prev_y, prev_z = curr_x, curr_y, curr_z
+                    self.rcl._create_default_waypoint_odm()
+
+            except Exception as e:
+                print(f"Error occurred while creating waypoints: {e}")
+                
+    def _stop_making_map_downloading(self):
+        global PROCESS_THREAD
+        if PROCESS_THREAD is not None and PROCESS_THREAD.is_alive():
+            SHUTDOWN_FLAG.value = 1
+            print("追跡終了")
+            time.sleep(2.0)
+            
+        log_event("命令受理: 地図作成終了")
+        if self.recording_map == True:
+            try:
+                print("地図作成を終了します")
+                self.rcl._stop_recording()
+                log_event("地図作成終了: 地図作成を終了しました")
+                print("recording stop")
+                time.sleep(10.0)
+                self.recording_map = False
+                close_fiducial_loops = True
+                close_odometry_loops = True
+                self.rcl._auto_close_loops(close_fiducial_loops, close_odometry_loops)
+                log_event("地図作成終了: ループクローズを実行しました")
+                time.sleep(5)
+                print("-" * 80)
+                self.rcl._download_full_graph()
+                self.gcl._list_graph_waypoint_and_edge_ids()
+                log_event("地図作成終了: 地図をアップロードしました")
+                print("-" * 80)
+            except Exception as e:
+                log_event(f"エラー: {e}")
+                print(f"Error occurred: {e}")
+                return
+            finally:
+                self.thread_running = False
+                update_robot_state()
+                
+    
+    def _close_map(self):
+        global PROCESS_THREAD
+        if PROCESS_THREAD is not None and PROCESS_THREAD.is_alive():
+            SHUTDOWN_FLAG.value = 1
+            print("追跡終了")
+            time.sleep(2.0)
+            
+        log_event("命令受理: 地図作成終了")
+        try:
+            self.recording_map = False
+            close_fiducial_loops = True
+            close_odometry_loops = True
+            self.rcl._auto_close_loops(close_fiducial_loops, close_odometry_loops)
+            time.sleep(20)
+            log_event("地図作成終了: ループクローズを実行しました")
+        except Exception as e:
+            log_event(f"エラー: {e}")
+            print(f"Error occurred: {e}")
+            return
+
+    def _save_map(self):
+        global PROCESS_THREAD
+        if PROCESS_THREAD is not None and PROCESS_THREAD.is_alive():
+            SHUTDOWN_FLAG.value = 1
+            print("追跡終了")
+            time.sleep(2.0)
+            
+        try:
+            close_fiducial_loops = True
+            close_odometry_loops = True
+            self.rcl._auto_close_loops(close_fiducial_loops, close_odometry_loops)
+            time.sleep(20)
+            log_event("地図作成終了: ループクローズを実行しました")
+            log_event("命令受理: 地図保存")
+            print("地図を保存します")
+            self.rcl._download_full_graph()
+            self.gcl._list_graph_waypoint_and_edge_ids()
+            log_event("地図保存: 地図をダウンロードしました")
+            print("-" * 80)
+            
+        except Exception as e:
+            log_event(f"エラー: {e}")
+            print(f"Error occurred: {e}")
+            return
+        finally:
+            # self.thread_running = False
+            update_robot_state()
+            
+    def _map_download(self):
+        log_event("命令受理: 地図ダウンロード")
+        try:
+            if self.recording_map == True:
+                print("地図作成中はDLできません")
+                print("-" * 80)
+                return
+            else:
+                print("地図をダウンロードします")
+                # engine.say("downloading the map made")
+                # engine.runAndWait()
+                # voice_output("downloading the map made")
+                
+                time.sleep(2.0)
+
+                close_fiducial_loops = True
+                close_odometry_loops = True
+                self.rcl._auto_close_loops(close_fiducial_loops, close_odometry_loops)
+                log_event("地図ダウンロード: ループクローズを実行しました")
+
+                # engine.runAndWait()
+                # print("thread")
+                # マップのクロージング
+                
+                # print("地図をアップロードします")
+                # engine.say("uploading the map to host PC")
+                # # engine.runAndWait()
+                self.gcl._upload_graph_and_snapshots()
+                # print("地図を作成順に並び替えます")
+                self.gcl._list_graph_waypoint_and_edge_ids()
+                log_event("地図ダウンロード: 地図をアップロードしました")
+                # print("-" * 80)
+                
+                # engine.say("complete downloading the map")
+                # engine.runAndWait()
+                # voice_output("complete downloading the map")
+                # self._spot_pose_bow()
+                print("-" * 80)
+                
+        except Exception as e:
+            print(f"Error occurred: {e}")
+            log_event(f"エラー: {e}")
+            return
+        
+        finally:
+            self.thread_running = False
+        
+
+    def _initialize(self):
+        # engine.say("initialize localize position")
+        # engine.runAndWait()
+        # voice_output("initialize localize position")
+        log_event("命令受理: 初期化")
+        time.sleep(1.5)
+        try:
+            self.gcl._set_initial_localization_fiducial()
+            waypoint = self.gcl._get_localization_id()
+            print("waypoint", waypoint)
+            log_event("QRコードでの初期化に成功しました")
+        except:
+            try:
+                self.gcl._set_initial_localization_waypoint()
+            except:
+                print("QRコードでの初期化に失敗しました")
+                print("waypointでの初期化に失敗しました")
+                log_event("QRコードでの初期化に失敗しました")
+                log_event("waypointでの初期化に失敗しました")
+                print("-" * 80)
+                return
+        # self.initialize = True
+        # print("地図をダウンロードします")
+        # engine.say("initialize position")
+        # engine.runAndWait()
+        
+        finally:
+            self.thread_running = False
+        
+    def _sit_down(self):
         try:
             if self.recording_map == True:
                 print("地図作成中には座れません")
@@ -731,7 +1841,7 @@ class CommandProcess():
         finally:
             self.thread_running = False
         
-    def _spot_stand_up(self):
+    def _stand_up(self):
         try:
             if self.recording_map == True:
                 print("地図作成中には立ち上がれません")
@@ -752,8 +1862,46 @@ class CommandProcess():
         finally:
             self.thread_running = False
             
+            
+    def _map_upload_and_sort(self):
+        log_event("命令受理: 地図アップロード")
+        try:
+            if self.recording_map == True:
+                print("地図作成中はアップロードできません")
+                print("-" * 80)
+                return
+            else:
+                # engine.say("uploading the map to host PC")
+                # engine.runAndWait()
+                # voice?_output("uploading the map from host PC")
+                print("地図の最適化")   
+                close_fiducial_loops = True
+                close_odometry_loops = True
+                self.rcl._auto_close_loops(close_fiducial_loops, close_odometry_loops)
+                log_event("地図アップロード: ループクローズを実行しました")
+                
+                print("地図をアップロードします")
+                self.gcl._upload_graph_and_snapshots()
+                print("地図を作成順に並び替えます")
+                self.gcl._list_graph_waypoint_and_edge_ids()
+                
+                log_event("地図アップロード: 地図をアップロードしました")
+                
+                # voice?_output("complete uploading the map")
+                print("-" * 80)
+                
+                # self._spot_pose_bow()
+        except Exception as e:
+            print(f"Error occurred: {e}")
+            log_event(f"エラー: {e}")
+            return
         
-    def _spot_detect_and_follow(self):
+        finally:
+            self.thread_running = False
+        
+        
+        
+    def _detect_and_follow(self):
         global PROCESS_THREAD, SHUTDOWN_FLAG
         try:
             if PROCESS_THREAD is None or not PROCESS_THREAD.is_alive():
@@ -773,7 +1921,7 @@ class CommandProcess():
         finally:
             self.thread_running = False
             
-    def _spot_stop_follow(self):
+    def _stop_follow(self):
         global PROCESS_THREAD
         if PROCESS_THREAD is not None and PROCESS_THREAD.is_alive():
             SHUTDOWN_FLAG.value = 1
@@ -783,8 +1931,343 @@ class CommandProcess():
         log_event("命令完了: 追跡停止完了")
         print("-" * 80)
             
+                
+            
+    def _create_waypoint(self):
+        global PROCESS_THREAD
+        if self.recording_map == True:
+            self.rcl._create_default_waypoint()
+            log_event("命令受理: ウェイポイント作成")
+            # engine.say("create waypoint")
+            # engine.runAndWait()
+            # voice_output("create waypoint")
+        else:
+            print("地図作成中ではありません")
+            # return
+
+        print("-" * 80)
+
+        self.thread_running = False
         
-    def _spot_go_to_front(self):
+        
+    def _navigate_to_first_position(self):
+        global PROCESS_THREAD
+        log_event("命令受理: 最初の位置に戻る")
+        try:
+            if self.recording_map == True:
+                print("地図作成中は戻れません")
+                print("-" * 80)
+                return
+            
+            elif self.gcl._waypoint_all_id == None:
+                print("マップの最適化を行ってください")
+                print("-" * 80)
+                return
+            
+            elif PROCESS_THREAD is not None and PROCESS_THREAD.is_alive():
+                # engine.say("It's running followings")
+                # engine.runAndWait()
+                # voice_output("It's running followings")
+                time.sleep(1.0)
+                return
+            
+            else:
+                print("最初の位置に戻ります")
+                # engine.say("navigate to first position")
+                # engine.runAndWait()
+                # voice_output("navigate to first position")
+                # 初期化されていない場合（プログラム起動時）には初期化を行うようにする
+                if self.initialize == False:
+                    try:
+                        self.gcl._set_initial_localization_fiducial()
+                    except:
+                        try:
+                            self.gcl._set_initial_localization_waypoint()
+                        except:
+                            print("QRコードでの初期化に失敗しました")
+                            print("waypointでの初期化に失敗しました")
+                            print("-" * 80)
+                            return
+                    self.initialize = True
+                position = self.gcl._waypoint_all_id[0]
+                print(f"First waypoint id: {position}")
+                log_event(f"最初の位置に戻ります: {position}")
+                update_robot_state(initializing=True)
+                self.gcl._navigate_first_waypoint(position)
+                update_robot_state()
+                # 最初の地点に戻るたびに初期化を行う
+                if self.initialize == True:
+                    try:
+                        self.gcl._set_initial_localization_fiducial()
+                    except:
+                        print("初期化に失敗しました")
+                        print("-" * 80)
+                        return
+                print("-" * 80)
+        except Exception as e:
+            print(f"Error occurred: {e}")
+            log_event(f"エラー: {e}")
+            return
+        
+        finally:
+            self.thread_running = False
+            
+            
+    def _navigate_to_last_position(self):
+        global PROCESS_THREAD
+        # while True:
+        #     try:
+        #         engine.say("go back previous position")
+        #         engine.runAndWait()
+        #         break  # 成功したらループを終了
+        #     except Exception as e:
+        #         print(f"Error occurred: {e}")
+        #         time.sleep(0.5)  # 少し待ってから再試行
+        # voice_output("go back previous position")
+        
+        log_event("命令受理: 最後の位置に戻る")
+        try:
+            self.gcl._set_initial_localization_fiducial()
+        except Exception as e:
+            print(f"Error occurred: {e}")
+        
+        try:
+            current_waypoint_id, current_waypoint_name, current  = self.gcl._get_localication_id()
+            # self.before_unique_position_id = current_waypoint_id
+            # self.before_unique_position = current
+            if current_waypoint_id == None or current_waypoint_name == None or current == None:
+                return
+
+            # 向かう先のwaypointを取得
+            if self.before_unique_position_id == None or self.before_unique_position == None:
+                return
+            
+            print(f"Current waypoint id: {current_waypoint_id}, Goal waypoint id: {self.before_unique_position_id}")
+            
+            if current == self.before_unique_position:
+                print("同じwaypointです")
+                log_event("同じwaypointにつき、移動しません")
+                return
+            
+            print("目的地に向かいます")
+            
+            log_event("")
+            update_robot_state(returning=True)
+            self.gcl._navigate_route_to_user_waypoint(current, current_waypoint_id, self.before_unique_position, self.before_unique_position_id)
+            update_robot_state()
+        except Exception as e:
+            print(f"Error occurred: {e}")
+            log_event(f"エラー: {e}")
+            return
+        
+        finally:
+            self.thread_running = False
+            
+    def _navigate_route_all(self):
+        global PROCESS_THREAD
+        try:
+            if self.recording_map == True:
+                print("地図作成中にその操作はできません")
+                print("-" * 80)
+                return
+            else:
+                try:
+                    self.gcl._set_initial_localization_fiducial()
+                except:
+                    try:
+                        self.gcl._set_initial_localization_waypoint()
+                    except:
+                        print("QRコードでの初期化に失敗しました")
+                        print("waypointでの初期化に失敗しました")
+                        print("-" * 80)
+                        return
+            
+                print("ルートを全て歩きます")
+                # threadで作成することで、他の操作を行えるようにする
+                # autowalk_thread = threading.Thread(target=self.gcl._navigate_route, daemon=True)
+                # autowalk_thread.start()
+                self.gcl._navigate_route()
+                
+        except Exception as e:
+            print(f"Error occurred: {e}")
+            return
+        
+        finally:
+            self.thread_running = False
+            
+            
+    def _navigate_to_unique_position_thinning(self):
+        global PROCESS_THREAD
+        
+        if PROCESS_THREAD is not None and PROCESS_THREAD.is_alive():
+            # engine.say("It's running followings")
+            # engine.runAndWait()
+            # voice_output("It's running followings")
+            time.sleep(1.0)
+            return
+        time.sleep(1.0)
+        
+        log_event("命令受理: 保存場所に戻る")
+        try:
+            self.gcl._set_initial_localization_fiducial()
+        except Exception as e:
+            print(f"Error occurred: {e}")
+        try:
+            current_waypoint_id, current_waypoint_name, current  = self.gcl._get_localication_id()
+            self.before_unique_position_id = current_waypoint_id
+            self.before_unique_position = current
+            if current_waypoint_id == None or current_waypoint_name == None or current == None:
+                return
+
+            # 向かう先のwaypointを取得
+            goal_waypoint_name, goal_waypoint_id, goal = self.gcl._get_user_waypoint()
+            if goal_waypoint_id == None or goal_waypoint_name == None or goal == None:
+                return
+            
+            print(f"Current waypoint id: {current_waypoint_id}, Goal waypoint id: {goal_waypoint_id}")
+            
+            if current == goal:
+                print("同じwaypointです")
+                log_event("同じwaypointにつき、移動しません")
+                return
+            
+            print("目的地に向かいます")
+            
+            
+            update_robot_state(going_save=True)
+            self.gcl._navigate_route_to_user_waypoint(current, current_waypoint_id, goal, goal_waypoint_id)
+            update_robot_state()
+            
+            self._spot_thinning_pose()
+            
+            time.sleep(1.0)
+            
+            # 目的地到着
+            # self._spot_pose_bow()
+            
+            # self.gcl._navigate_route_to_user_waypoint(current, current_waypoint_id, goal, goal_waypoint_id)
+        except Exception as e:
+            # engine.say("I can't navigate to the place")
+            # engine.runAndWait()
+            # voice_output("I can't navigate to the place")
+            print(f"Error occurred: {e}")
+            log_event(f"エラー: {e}")
+            return
+        
+        finally:
+            self.thread_running = False
+            
+    def _navigate_to_unique_position(self):
+        global PROCESS_THREAD
+        
+        if PROCESS_THREAD is not None and PROCESS_THREAD.is_alive():
+            # engine.say("It's running followings")
+            # engine.runAndWait()
+            # voice_output("It's running followings")
+            time.sleep(1.0)
+            return
+        time.sleep(1.0)
+        
+        log_event("命令受理: 保存場所に戻る")
+        try:
+            self.gcl._set_initial_localization_fiducial()
+        except Exception as e:
+            print(f"Error occurred: {e}")
+        try:
+            current_waypoint_id, current_waypoint_name, current  = self.gcl._get_localication_id()
+            self.before_unique_position_id = current_waypoint_id
+            self.before_unique_position = current
+            if current_waypoint_id == None or current_waypoint_name == None or current == None:
+                return
+
+            # 向かう先のwaypointを取得
+            goal_waypoint_name, goal_waypoint_id, goal = self.gcl._get_user_waypoint()
+            if goal_waypoint_id == None or goal_waypoint_name == None or goal == None:
+                return
+            
+            print(f"Current waypoint id: {current_waypoint_id}, Goal waypoint id: {goal_waypoint_id}")
+            
+            if current == goal:
+                print("同じwaypointです")
+                log_event("同じwaypointにつき、移動しません")
+                return
+            
+            print("目的地に向かいます")
+            
+            
+            update_robot_state(going_save=True)
+            self.gcl._navigate_route_to_user_waypoint(current, current_waypoint_id, goal, goal_waypoint_id)
+            update_robot_state()
+            
+            # self._spot_bow_pose()
+            
+            time.sleep(1.0)
+            
+            # 目的地到着
+            # self._spot_pose_bow()
+            
+            # self.gcl._navigate_route_to_user_waypoint(current, current_waypoint_id, goal, goal_waypoint_id)
+        except Exception as e:
+            # engine.say("I can't navigate to the place")
+            # engine.runAndWait()
+            # voice_output("I can't navigate to the place")
+            print(f"Error occurred: {e}")
+            log_event(f"エラー: {e}")
+            return
+        
+        finally:
+            self.thread_running = False
+            
+    def _spot_thinning(self):
+        log_event("命令受理: 摘果命令受理")
+
+        self._navigate_to_unique_position_thinning()
+        time.sleep(1.0)
+        self._navigate_to_last_position()
+            
+    def _spot_squat_pose(self):
+        
+        log_event("命令受理: しゃがむ")
+        robot_state = self.robot_state_client.get_robot_state()
+        odom_T_flat_body = get_a_tform_b(robot_state.kinematic_state.transforms_snapshot,
+                                         ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME)
+        # Specify a trajectory to shift the body forward followed by looking down, then return to nominal.
+        # Define times (in seconds) for each point in the trajectory.
+        t1 = 0.5
+        t2 = 2.0
+        t3 = 3.0
+
+        # Specify the poses as transformations to the cached flat_body pose.
+        flat_body_T_pose1 = math_helpers.SE3Pose(x=0, y=0, z=0, rot=math_helpers.Quat())
+        flat_body_T_pose2 = math_helpers.SE3Pose(
+            x=0.0, y=0, z=-0.3, rot=math_helpers.Quat())
+        flat_body_T_pose3 = math_helpers.SE3Pose(x=0.0, y=0, z=0, rot=math_helpers.Quat())
+
+        # Build the points in the trajectory.
+        traj_point1 = trajectory_pb2.SE3TrajectoryPoint(
+            pose=(odom_T_flat_body * flat_body_T_pose1).to_proto(),
+            time_since_reference=seconds_to_duration(t1))
+        traj_point2 = trajectory_pb2.SE3TrajectoryPoint(
+            pose=(odom_T_flat_body * flat_body_T_pose2).to_proto(),
+            time_since_reference=seconds_to_duration(t2))
+        traj_point3 = trajectory_pb2.SE3TrajectoryPoint(
+            pose=(odom_T_flat_body * flat_body_T_pose3).to_proto(),
+            time_since_reference=seconds_to_duration(t3))
+
+        # Build the trajectory proto by combining the points.
+        traj = trajectory_pb2.SE3Trajectory(points=[traj_point1, traj_point2, traj_point3])
+
+        # Build a custom mobility params to specify absolute body control.
+        body_control = spot_command_pb2.BodyControlParams(
+            body_pose=spot_command_pb2.BodyControlParams.BodyPose(root_frame_name=ODOM_FRAME_NAME,
+                                                                  base_offset_rt_root=traj))
+        blocking_stand(self.robot_command_client, timeout_sec=10,
+                       params=spot_command_pb2.MobilityParams(body_control=body_control))
+        
+        time.sleep(3.5)
+        self.thread_running = False
+        
+    def _go_to_front(self):
         global PROCESS_THREAD
         # engine.say("go to front")
         # engine.runAndWait()
@@ -807,7 +2290,7 @@ class CommandProcess():
         #     return
         self.thread_running = False
             
-    def _spot_move_front_thread(self):
+    def _move_front_thread(self):
         while self._is_spot_go_front:
             robot_state = self.robot_state_client.get_robot_state()
             mobility_params = create_mobility_params(0.3, 0.5)
@@ -824,7 +2307,7 @@ class CommandProcess():
                 self._is_spot_go_front = False
                 return
             
-    def _spot_go_to_back(self):
+    def _go_to_back(self):
         global PROCESS_THREAD
         # engine.say("go to back")
         # engine.runAndWait()
@@ -848,7 +2331,7 @@ class CommandProcess():
         
         self.thread_running = False
         
-    def _spot_move_back_thread(self):
+    def _move_back_thread(self):
         while self._is_spot_go_back:
             robot_state = self.robot_state_client.get_robot_state()
             mobility_params = create_mobility_params(0.1, 0.5)
@@ -865,7 +2348,7 @@ class CommandProcess():
                 self._is_spot_go_back = False
                 return
             
-    def _spot_go_front_little(self):
+    def _go_front_little(self):
         try:
             log_event("命令受理: 少し前進")
             robot_state = self.robot_state_client.get_robot_state()
@@ -887,7 +2370,7 @@ class CommandProcess():
 
         return
     
-    def _spot_go_back_little(self):
+    def _go_back_little(self):
         try:
             log_event("命令受理: 少し後退")
             robot_state = self.robot_state_client.get_robot_state()
@@ -910,7 +2393,7 @@ class CommandProcess():
         return
 
     
-    def _spot_go_right_little(self):
+    def _go_right_little(self):
         try:
             log_event("命令受理: 少し右に移動")
             robot_state = self.robot_state_client.get_robot_state()
@@ -932,7 +2415,7 @@ class CommandProcess():
 
         return
     
-    def _spot_go_left_little(self):
+    def _go_left_little(self):
         try:
             log_event("命令受理: 少し左に移動")
             robot_state = self.robot_state_client.get_robot_state()
@@ -1000,20 +2483,158 @@ class CommandProcess():
         time.sleep(3.5)
         self.thread_running = False
         
-    def _spot_rotate(self):
-        log_event("命令受理: 回転")
+    def _spot_bow_pose(self):
+        """Command the robot to bow."""
+            
         robot_state = self.robot_state_client.get_robot_state()
         odom_T_flat_body = get_a_tform_b(robot_state.kinematic_state.transforms_snapshot,
-                                         ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME)
+                                            ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME)
         # Specify a trajectory to shift the body forward followed by looking down, then return to nominal.
         # Define times (in seconds) for each point in the trajectory.
-        mobility_params = create_mobility_params(0.75, 0.6)
-        tag_cmd = RobotCommandBuilder.synchro_trajectory_command_in_body_frame(0, 0, math.pi,
-            robot_state.kinematic_state.transforms_snapshot, mobility_params)
-        end_time = 20.0
-        self.robot_command_client.robot_command(lease=None, command=tag_cmd,
-                                        end_time_secs=time.time() + end_time)
+        """
+        t1 -> t2: おじぎを始める
+        """
+        t1 = 0.0
+        t2 = 0.5
+
         
+        # おじぎの角度
+        degree = 25
+        w = math.cos(math.radians(degree/2))
+        y = math.sin(math.radians(degree/2))
+
+        # Specify the poses as transformations to the cached flat_body pose.
+        flat_body_T_pose1 = math_helpers.SE3Pose(x=0, y=0, z=0, rot=math_helpers.Quat())
+        flat_body_T_pose2 = math_helpers.SE3Pose(
+            x=0.0, y=0, z=0, rot=math_helpers.Quat(w=w, x=0, y=y, z=0))
+
+        # Build the points in the trajectory.
+        traj_point1 = trajectory_pb2.SE3TrajectoryPoint(
+            pose=(odom_T_flat_body * flat_body_T_pose1).to_proto(),
+            time_since_reference=seconds_to_duration(t1))
+        traj_point2 = trajectory_pb2.SE3TrajectoryPoint(
+            pose=(odom_T_flat_body * flat_body_T_pose2).to_proto(),
+            time_since_reference=seconds_to_duration(t2))
+        # Build the trajectory proto by combining the points.
+        traj = trajectory_pb2.SE3Trajectory(points=[traj_point1, traj_point2])
+
+        # Build a custom mobility params to specify absolute body control.
+        body_control = spot_command_pb2.BodyControlParams(
+            body_pose=spot_command_pb2.BodyControlParams.BodyPose(root_frame_name=ODOM_FRAME_NAME,
+                                                                    base_offset_rt_root=traj))
+        blocking_stand(self.robot_command_client, timeout_sec=3,
+                        params=spot_command_pb2.MobilityParams(body_control=body_control))
+        
+        time.sleep(0.6)
+        GPIO.output(pin_out,1)
+        """
+        # 入力を待つ
+        while True:
+            print("continue to come back? -> y")
+            if input() == "y":
+                break
+            time.sleep(0.1)
+        """
+        time.sleep(3.0)
+
+        GPIO.output(pin_out,0)
+        t3 = 0.0
+        t4 = 0.5
+        flat_body_T_pose3 = math_helpers.SE3Pose(
+            x=0.0, y=0, z=0, rot=math_helpers.Quat(w=w, x=0, y=y, z=0))
+        flat_body_T_pose4 = math_helpers.SE3Pose(x=0, y=0, z=0, rot=math_helpers.Quat())
+        
+        traj_point3 = trajectory_pb2.SE3TrajectoryPoint(
+            pose=(odom_T_flat_body * flat_body_T_pose3).to_proto(),
+            time_since_reference=seconds_to_duration(t3))
+        traj_point4 = trajectory_pb2.SE3TrajectoryPoint(
+            pose=(odom_T_flat_body * flat_body_T_pose4).to_proto(),
+            time_since_reference=seconds_to_duration(t4))
+        
+        traj = trajectory_pb2.SE3Trajectory(points=[traj_point3, traj_point4])
+        body_control = spot_command_pb2.BodyControlParams(
+            body_pose=spot_command_pb2.BodyControlParams.BodyPose(root_frame_name=ODOM_FRAME_NAME,
+                                                                    base_offset_rt_root=traj))
+        blocking_stand(self.robot_command_client, timeout_sec=3,
+                        params=spot_command_pb2.MobilityParams(body_control=body_control))
+        
+        time.sleep(3.0)
+    
+    def _spot_thinning_pose(self):
+        """Command the robot to thin."""
+        robot_state = self.robot_state_client.get_robot_state()
+        odom_T_flat_body = get_a_tform_b(robot_state.kinematic_state.transforms_snapshot,
+                                            ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME)
+        # Specify a trajectory to shift the body forward followed by looking down, then return to nominal.
+        # Define times (in seconds) for each point in the trajectory.
+        """
+        t1 -> t2: おじぎを始める
+        """
+        t1 = 0.0
+        t2 = 0.5
+
+        
+        # おじぎの角度
+        degree = 25
+        w = math.cos(math.radians(degree/2))
+        y = math.sin(math.radians(degree/2))
+
+        # Specify the poses as transformations to the cached flat_body pose.
+        flat_body_T_pose1 = math_helpers.SE3Pose(x=0, y=0, z=0, rot=math_helpers.Quat())
+        flat_body_T_pose2 = math_helpers.SE3Pose(
+            x=0.0, y=0, z=0, rot=math_helpers.Quat(w=w, x=0, y=y, z=0))
+
+        # Build the points in the trajectory.
+        traj_point1 = trajectory_pb2.SE3TrajectoryPoint(
+            pose=(odom_T_flat_body * flat_body_T_pose1).to_proto(),
+            time_since_reference=seconds_to_duration(t1))
+        traj_point2 = trajectory_pb2.SE3TrajectoryPoint(
+            pose=(odom_T_flat_body * flat_body_T_pose2).to_proto(),
+            time_since_reference=seconds_to_duration(t2))
+        # Build the trajectory proto by combining the points.
+        traj = trajectory_pb2.SE3Trajectory(points=[traj_point1, traj_point2])
+
+        # Build a custom mobility params to specify absolute body control.
+        body_control = spot_command_pb2.BodyControlParams(
+            body_pose=spot_command_pb2.BodyControlParams.BodyPose(root_frame_name=ODOM_FRAME_NAME,
+                                                                    base_offset_rt_root=traj))
+        blocking_stand(self.robot_command_client, timeout_sec=3,
+                        params=spot_command_pb2.MobilityParams(body_control=body_control))
+        
+        time.sleep(0.6)
+        GPIO.output(pin_out,1)
+        """
+        # 入力を待つ
+        while True:
+            print("continue to come back? -> y")
+            if input() == "y":
+                break
+            time.sleep(0.1)
+        """
+        time.sleep(3.0)
+
+        GPIO.output(pin_out,0)
+        t3 = 0.0
+        t4 = 0.5
+        flat_body_T_pose3 = math_helpers.SE3Pose(
+            x=0.0, y=0, z=0, rot=math_helpers.Quat(w=w, x=0, y=y, z=0))
+        flat_body_T_pose4 = math_helpers.SE3Pose(x=0, y=0, z=0, rot=math_helpers.Quat())
+        
+        traj_point3 = trajectory_pb2.SE3TrajectoryPoint(
+            pose=(odom_T_flat_body * flat_body_T_pose3).to_proto(),
+            time_since_reference=seconds_to_duration(t3))
+        traj_point4 = trajectory_pb2.SE3TrajectoryPoint(
+            pose=(odom_T_flat_body * flat_body_T_pose4).to_proto(),
+            time_since_reference=seconds_to_duration(t4))
+        
+        traj = trajectory_pb2.SE3Trajectory(points=[traj_point3, traj_point4])
+        body_control = spot_command_pb2.BodyControlParams(
+            body_pose=spot_command_pb2.BodyControlParams.BodyPose(root_frame_name=ODOM_FRAME_NAME,
+                                                                    base_offset_rt_root=traj))
+        blocking_stand(self.robot_command_client, timeout_sec=3,
+                        params=spot_command_pb2.MobilityParams(body_control=body_control))
+        
+        time.sleep(3.0)
         
     def _exit_program(self):
         global PROCESS_THREAD, SHUTDOWN_FLAG
@@ -1132,6 +2753,7 @@ def main():
         robot_state_client = robot.ensure_client(RobotStateClient.default_service_name)
         robot_command_client = robot.ensure_client(RobotCommandClient.default_service_name)
         lease_client = robot.ensure_client(LeaseClient.default_service_name)
+        LEASE = lease_client
 
         print("create client")
 
@@ -1143,6 +2765,9 @@ def main():
         lease_keep = LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True)
         # Power on the robot and stand it up
         resp = robot.power_on()
+        
+        GPIO.setmode(GPIO.BOARD)
+        GPIO.setup(pin_out, GPIO.OUT, initial=GPIO.LOW)
 
         try:
             blocking_stand(robot_command_client)
@@ -1167,8 +2792,21 @@ def main():
         if sound_check == None:
             print("音声デバイスの設定に失敗しました")
             return
+        # sd.RawInputStream(samplerate=16000, blocksize=8000, device=None, channels=1, callback=callback)
+
+        """graphnavに関する部分"""
+        print("GraphNav setting")
+        client_metadata = GraphNavRecordingServiceClient.make_client_metadata(
+            session_name="", client_username="", client_id='RecordingClient',
+            client_type='Python SDK')
+        recording_command_line = RecordingInterface(robot, os.getcwd(), client_metadata,
+                                                False)
         
-        cp = CommandProcess(robot, robot_state_client, robot_command_client)
+        # graphnav_command_line = GraphNavInterface(robot, "downloaded_graph", False)
+        
+        # time.sleep(2)
+        
+        cp = CommandProcess(robot, client_metadata, robot_state_client, robot_command_client)
         
         
         # 修正: 固定の16000ではなく、動的に取得したSAMPLE_RATEを使用
@@ -1228,6 +2866,9 @@ def main():
     except Exception as exc:  # pylint: disable=broad-except
         LOGGER.error('Spot jetson threw an exception: %s', exc)
         return False
+    
+    finally:
+        GPIO.cleanup()
 
 if __name__ == "__main__":
     main()

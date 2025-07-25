@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>Log Viewer</title>
+  <style>
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: #fff9db;
+      margin: 0;
+      padding: 20px;
+      color: #333;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+    }
+    #container {
+      width: 90%;
+      max-width: 800px;
+      background: #fff;
+      padding: 20px;
+      box-shadow: 0 6px 12px rgba(0,0,0,0.15);
+      border-radius: 12px;
+      text-align: center;
+      position: relative;
+    }
+    
+    /* ハンバーガーメニューのスタイル */
+    .hamburger {
+      position: absolute;
+      top: 20px;
+      right: 20px;
+      width: 30px;
+      height: 30px;
+      cursor: pointer;
+      z-index: 1000;
+    }
+    
+    .hamburger span {
+      display: block;
+      width: 25px;
+      height: 3px;
+      background: #333;
+      margin: 5px 0;
+      transition: 0.3s;
+    }
+    
+    .hamburger.active span:nth-child(1) {
+      transform: rotate(-45deg) translate(-5px, 6px);
+    }
+    
+    .hamburger.active span:nth-child(2) {
+      opacity: 0;
+    }
+    
+    .hamburger.active span:nth-child(3) {
+      transform: rotate(45deg) translate(-5px, -6px);
+    }
+    
+    /* サイドメニューのスタイル */
+    .side-menu {
+      position: fixed;
+      top: 0;
+      right: -300px;
+      width: 300px;
+      height: 100vh;
+      background: #fff;
+      box-shadow: -2px 0 10px rgba(0,0,0,0.15);
+      transition: right 0.3s ease;
+      z-index: 999;
+      padding: 60px 20px 20px 20px;
+      box-sizing: border-box;
+      overflow-y: auto;
+    }
+    
+    .side-menu.open {
+      right: 0;
+    }
+    
+    .side-menu h3 {
+      color: #444;
+      margin-bottom: 20px;
+      border-bottom: 2px solid #e0c070;
+      padding-bottom: 10px;
+    }
+    
+    .menu-button {
+      width: 100%;
+      padding: 12px;
+      margin: 8px 0;
+      border: 1px solid #e0c070;
+      background: #ffeb99;
+      color: #333;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 14px;
+      transition: background 0.3s;
+    }
+    
+    .menu-button:hover {
+      background: #ffd966;
+    }
+    
+    /* オーバーレイ */
+    .overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      background: rgba(0,0,0,0.5);
+      z-index: 998;
+      opacity: 0;
+      visibility: hidden;
+      transition: opacity 0.3s, visibility 0.3s;
+    }
+    
+    .overlay.show {
+      opacity: 1;
+      visibility: visible;
+    }
+    
+    #state, #logs {
+      width: 90%;
+      margin: 0 auto;
+    }
+    h1 {
+      color: #444;
+      margin-bottom: 20px;
+    }
+    #state {
+      padding: 15px;
+      font-size: 1.2em;
+      background: #ffeb99;
+      border: 1px solid #e0c070;
+      border-radius: 8px;
+      margin-bottom: 15px;
+      text-align: center;
+      word-break: break-word;
+      font-weight: bold;
+    }
+    #logs {
+      height: 500px;
+      border: 1px solid #e0c070;
+      overflow-y: auto;
+      background: #fff7d1;
+      padding: 15px;
+      font-family: monospace;
+      white-space: pre-wrap;
+      border-radius: 8px;
+      line-height: 1.5;
+      text-align: left;
+    }
+    #capture {
+      margin-top: 20px;
+      max-width: 100%;
+      border: 1px solid #e0c070;
+      border-radius: 8px;
+    }
+    /* 正円のボタンにするため、幅と高さを同じ値に設定 */
+    #leaseButton {
+      width: 50px;
+      height: 50px;
+      border: none;
+      background-color: #4CAF50;
+      color: white;
+      padding: 0;
+      text-align: center;
+      text-decoration: none;
+      display: inline-block;
+      font-size: 16px;
+      margin: 10px;
+      border-radius: 50%;
+      cursor: pointer;
+      line-height: 50px;
+    }
+  </style>
+</head>
+<body>
+  <div class="overlay" id="overlay"></div>
+  
+  <div id="container">
+    <!-- ハンバーガーメニューボタン -->
+    <div class="hamburger" id="hamburger">
+      <span></span>
+      <span></span>
+      <span></span>
+    </div>
+    
+    <h1>Log Viewer</h1>
+    <div id="state">状態：--</div>
+    <div id="logs"></div>
+    <div id="capture-container" style="display: flex; align-items: center; justify-content: center;">
+      <img id="capture" src="" alt="Camera Capture">
+      <button id="leaseButton" onclick="takeLease()">操作権</button>
+    </div>
+  </div>
+  
+  <!-- サイドメニュー -->
+  <div class="side-menu" id="sideMenu">
+    <h3>基本操作</h3>
+    <button class="menu-button" onclick="executeCommand('sit')">座る</button>
+    <button class="menu-button" onclick="executeCommand('stand')">立つ</button>
+    <button class="menu-button" onclick="executeCommand('follow')">追跡</button>
+    <button class="menu-button" onclick="executeCommand('stop')">停止</button>
+    
+    <h3>システム</h3>
+    <button class="menu-button" onclick="executeCommand('docking')">ドッキング</button>
+    <button class="menu-button" onclick="executeCommand('undocking')">ドッキング解除</button>
+    <button class="menu-button" onclick="executeCommand('bow')">お辞儀</button>
+    <button class="menu-button" onclick="executeCommand('squat')">スクアット</button>
+  </div>
+  
+  <script>
+    // ハンバーガーメニューの制御
+    const hamburger = document.getElementById('hamburger');
+    const sideMenu = document.getElementById('sideMenu');
+    const overlay = document.getElementById('overlay');
+    
+    hamburger.addEventListener('click', function() {
+      hamburger.classList.toggle('active');
+      sideMenu.classList.toggle('open');
+      overlay.classList.toggle('show');
+    });
+    
+    overlay.addEventListener('click', function() {
+      hamburger.classList.remove('active');
+      sideMenu.classList.remove('open');
+      overlay.classList.remove('show');
+    });
+    
+    // サンプルコマンド実行関数
+    function executeCommand(command) {
+      fetch('/command', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ command: command })
+      })
+      .then(response => response.json())
+      .then(data => {
+        alert('コマンド実行: ' + command + '\n結果: ' + (data.message || data.status));
+        // メニューを閉じる
+        hamburger.classList.remove('active');
+        sideMenu.classList.remove('open');
+        overlay.classList.remove('show');
+      })
+      .catch(error => {
+        console.error('Error:', error);
+        alert('コマンド実行エラー: ' + command);
+      });
+    }
+    
+    function fetchStatusAndLogs(){
+      fetch("/update")
+        .then(response => response.json())
+        .then(data => {
+          document.getElementById("state").innerHTML = "状態：" + data.state;
+          const logsDiv = document.getElementById("logs");
+          logsDiv.innerHTML = data.logs.join("\n");
+          logsDiv.scrollTop = logsDiv.scrollHeight;
+          document.getElementById("capture").src = data.capture ? data.capture + "?t=" + new Date().getTime() : "";
+        })
+        .catch(error => console.error('Error:', error));
+    }
+    function takeLease(){
+      fetch('/getlease', { method: 'POST' })
+        .then(response => response.json())
+        .then(data => alert(data.message))
+        .catch(error => console.error('Error:', error));
+    }
+    window.onload = function(){
+      fetchStatusAndLogs();
+      setInterval(fetchStatusAndLogs, 5000);
+    }
+  </script>
+</body>
+</html>
