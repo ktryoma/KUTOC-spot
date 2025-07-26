@@ -292,9 +292,11 @@ class RecordingInterface(object):
 class GraphNavInterface(object):
     """GraphNav service command line interface."""
 
-    def __init__(self, robot, upload_path, use_gps=False):
+    def __init__(self, robot, upload_path, use_gps=False, 
+                 speed_limit=1.2):
         self._robot = robot
         self.use_gps = use_gps
+        self._speed_limit = speed_limit
 
         # Force trigger timesync.
         self._robot.time_sync.wait_for_sync()
