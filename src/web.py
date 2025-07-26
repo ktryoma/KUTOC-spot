@@ -10,7 +10,8 @@ class WebServer:
     """Webサーバーとログ管理を行うクラス"""
     
     def __init__(self, processed_image_path="image"):
-        self.app = Flask(__name__)
+        template_folder = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'templates')
+        self.app = Flask(__name__, template_folder=template_folder)
         self.log_messages = []
         self.current_state = "待機状態"
         self.processed_image_path = processed_image_path
