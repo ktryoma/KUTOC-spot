@@ -3,7 +3,7 @@ import glob
 import logging
 import datetime
 from typing import Optional
-from src.command_process import get_web_commands_dict
+from src.commands_config import get_web_commands_dict
 from flask import Flask, jsonify, render_template, send_from_directory, request
 
 class WebServer:
