@@ -126,7 +126,7 @@ def voice_output(text, engine):
 def recognize_speech():
     
     """音声をリアルタイムで認識し、終了条件を確認する"""
-    model = Model("vosk-model-ja-0.22")  # voskモデルのパスを指定
+    model = Model("../vosk-model-ja-0.22")  # voskモデルのパスを指定
     rec = KaldiRecognizer(model, 16000)
 
 

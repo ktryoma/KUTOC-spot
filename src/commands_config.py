@@ -24,7 +24,8 @@ def get_command_dict(instance):
         "を辞儀": instance._spot_bow_pose,
         "廃棄": instance._spot_thinning_pose,
         "を廃棄": instance._spot_thinning_pose,
-        "しゃがんで": instance._spot_squat_pose,
+        # "しゃがんで": instance._spot_squat_pose,
+        "しゃがんで": instance._spot_squat,
         "初期化": instance._initialize,
         "記憶": instance._create_waypoint,
         "曲": instance._create_waypoint,
@@ -40,6 +41,9 @@ def get_command_dict(instance):
         "ドッキング": instance._spot_docking,
         "解除": instance._spot_undocking,
         "充電": instance._spot_find_dock,
+        "回って": instance._spot_rotate,
+        "まわって": instance._spot_rotate,
+        "回転": instance._spot_rotate,
         # "トラック": instance._spot_thinning,
         "進め": instance._go_to_front,
         "進んで": instance._go_to_front,
@@ -64,10 +68,20 @@ def get_web_commands_dict(instance):
         'stand': instance._stand_up,         # 立つ
         'follow': instance._detect_and_follow, # 追跡
         'stop': instance._stop_follow,       # 停止
+        'memory': instance._spot_memory_truck, # 記憶
         'docking': instance._spot_docking,   # ドッキング
         'undocking': instance._spot_undocking, # ドッキング解除
         'bow': instance._spot_pose_bow,      # お辞儀
         'squat': instance._spot_squat_pose,  # しゃがむ
+        'lie_down': instance._spot_squat,  # 伏せる
+        'truck': instance._navigate_to_unique_position,
+        'thinning': instance._spot_thinning,  # 廃棄
+        'back': instance._navigate_to_last_position, # 元の場所に戻る
+        'charge': instance._spot_find_dock,  # 充電
+        'finish_charge': instance._spot_finish_dock, # 充電終了
+        'forward': instance._go_to_front,  # 前進
+        'backward': instance._go_to_back,  # 後退
+        'rotate': instance._spot_rotate,  # 回転
     }
     
 def get_keyboard_commands_dict(instance):

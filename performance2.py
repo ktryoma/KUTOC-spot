@@ -1024,7 +1024,8 @@ class CommandProcess():
 
     def _spot_find_dock(self):
         self.web_server.log_event("命令受理: ドックを探す")
-        self._navigate_to_unique_position()
+        # self._navigate_to_unique_position()
+        self._navigate_to_first_position()
         time.sleep(1.0)
         dock_id = 520
         blocking_go_to_prep_pose(self.robot, dock_id)
@@ -1032,10 +1033,30 @@ class CommandProcess():
         blocking_dock_robot(self.robot, dock_id)
         print("docking success")
         self.web_server.log_event("ドッキング成功")
+        
+    def _spot_memory_truck(self):
+        # self.web_server.log_event("命令受理: トラックの位置を記憶")
+        self.rcl._start_recording()
+        time.sleep(.5)
+        self.rcl._create_default_waypoint()
+        time.sleep(.5)
+        # self.rcl._stop_recording()
+        self._stop_making_map_downloading()
+        
+    def _spot_finish_dock(self):
+        self.web_server.log_event("命令受理: ドック解除し、舞台に戻る")
+        resp = self.robot.power_on()
+        dock_id = get_dock_id(self.robot)
+        if dock_id is None:
+            print("ドッキングされていません")
+            self.web_server.log_event("ドッキングされていません")
+        blocking_undock(self.robot)
+        time.sleep(1.0)
+        self._navigate_to_unique_position()
 
     def _spot_squat_pose(self):
 
-        self.web_server.log_event("命令受理: しゃがむ")
+        self.web_server.log_event("命令受理: スクワット")
         robot_state = self.robot_state_client.get_robot_state()
         odom_T_flat_body = get_a_tform_b(robot_state.kinematic_state.transforms_snapshot,
                                          ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME)
@@ -1075,6 +1096,57 @@ class CommandProcess():
         time.sleep(3.5)
         self.thread_running = False
         
+    def _spot_squat(self):
+
+        self.web_server.log_event("命令受理: しゃがむ")
+        robot_state = self.robot_state_client.get_robot_state()
+        odom_T_flat_body = get_a_tform_b(robot_state.kinematic_state.transforms_snapshot,
+                                         ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME)
+        # Specify a trajectory to shift the body forward followed by looking down, then return to nominal.
+        # Define times (in seconds) for each point in the trajectory.
+        t1 = 0.5
+        t2 = 2.0
+
+        # Specify the poses as transformations to the cached flat_body pose.
+        flat_body_T_pose1 = math_helpers.SE3Pose(x=0, y=0, z=0, rot=math_helpers.Quat())
+        flat_body_T_pose2 = math_helpers.SE3Pose(
+            x=0.0, y=0, z=-0.5, rot=math_helpers.Quat())
+
+        # Build the points in the trajectory.
+        traj_point1 = trajectory_pb2.SE3TrajectoryPoint(
+            pose=(odom_T_flat_body * flat_body_T_pose1).to_proto(),
+            time_since_reference=seconds_to_duration(t1))
+        traj_point2 = trajectory_pb2.SE3TrajectoryPoint(
+            pose=(odom_T_flat_body * flat_body_T_pose2).to_proto(),
+            time_since_reference=seconds_to_duration(t2))
+
+        # Build the trajectory proto by combining the points.
+        traj = trajectory_pb2.SE3Trajectory(points=[traj_point1, traj_point2])
+
+        # Build a custom mobility params to specify absolute body control.
+        body_control = spot_command_pb2.BodyControlParams(
+            body_pose=spot_command_pb2.BodyControlParams.BodyPose(root_frame_name=ODOM_FRAME_NAME,
+                                                                  base_offset_rt_root=traj))
+        blocking_stand(self.robot_command_client, timeout_sec=5,
+                       params=spot_command_pb2.MobilityParams(body_control=body_control))
+        
+        time.sleep(2.5)
+        self.thread_running = False
+        
+        
+    def _spot_rotate(self):
+
+        self.web_server.log_event("命令受理: 回転")
+        robot_state = self.robot_state_client.get_robot_state()
+        mobility_params = create_mobility_params(0.3, 0.5)
+        tag_cmd = RobotCommandBuilder.synchro_trajectory_command_in_body_frame(0, 0, 2* math.pi,
+                                robot_state.kinematic_state.transforms_snapshot, mobility_params)
+        end_time = 2.0
+        if tag_cmd is not None:
+            print('executing command')
+            self.robot_command_client.robot_command(lease=None, command=tag_cmd,
+                                                    end_time_secs=time.time() + end_time)
+        
     def _go_to_front(self):
         global PROCESS_THREAD
         # engine.say("go to front")
@@ -1091,11 +1163,11 @@ class CommandProcess():
             front_thread = threading.Thread(target=self._move_front_thread, daemon=True)
             front_thread.start()
             front_thread.join()
-        # if self._is_spot_go_front == True:
-        #     # 前進中のとき
-        #     # 進んでを2回言っても止まるようにはなってる
-        #     self._is_spot_go_front = False
-        #     return
+        if self._is_spot_go_front == True:
+            # 前進中のとき
+            # 進んでを2回言っても止まるようにはなってる
+            self._is_spot_go_front = False
+            return
         self.thread_running = False
             
     def _move_front_thread(self):
@@ -1111,7 +1183,7 @@ class CommandProcess():
                                                         end_time_secs=time.time() + end_time)
                 
             walk_end_time = time.time()
-            if walk_end_time - self.start_time >= 15.0:
+            if walk_end_time - self.start_time >= 10.0:
                 self._is_spot_go_front = False
                 return
             
@@ -1161,7 +1233,7 @@ class CommandProcess():
             self.web_server.log_event("命令受理: 少し前進")
             robot_state = self.robot_state_client.get_robot_state()
             mobility_params = create_mobility_params(0.8, 0.5)
-            tag_cmd = RobotCommandBuilder.synchro_trajectory_command_in_body_frame(0.5, 0, 0,
+            tag_cmd = RobotCommandBuilder.synchro_trajectory_command_in_body_frame(1.0, 0, 0,
                                     robot_state.kinematic_state.transforms_snapshot, mobility_params)
             end_time = 2.0
             if tag_cmd is not None:
@@ -1183,7 +1255,7 @@ class CommandProcess():
             self.web_server.log_event("命令受理: 少し後退")
             robot_state = self.robot_state_client.get_robot_state()
             mobility_params = create_mobility_params(0.8, 0.5)
-            tag_cmd = RobotCommandBuilder.synchro_trajectory_command_in_body_frame(-0.5, 0, 0,
+            tag_cmd = RobotCommandBuilder.synchro_trajectory_command_in_body_frame(-1.0, 0, 0,
                                     robot_state.kinematic_state.transforms_snapshot, mobility_params)
             end_time = 2.0
             if tag_cmd is not None:
