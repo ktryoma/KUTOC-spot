@@ -3,6 +3,9 @@ import glob
 import logging
 import datetime
 from typing import Optional
+
+import cv2
+
 from src.commands_config import get_web_commands_dict
 from flask import Flask, jsonify, render_template, send_from_directory, request
 
@@ -25,6 +28,14 @@ class WebServer:
         self.going_save_state = False        # 保存場所に向かう状態
         self.returning_state = False         # 戻って状態
         self.initializing_state = False      # 地図初期値に向かう状態
+
+        os.makedirs(self.processed_image_path, exist_ok=True)
+        black_image_path = os.path.join(self.processed_image_path, "black.jpg")
+        if not os.path.exists(black_image_path):
+            import numpy as np
+            # 画像サイズは 360x640 (高さ×幅)
+            black_img = np.zeros((360, 640, 3), dtype=np.uint8)
+            cv2.imwrite(black_image_path, black_img)
         
         # 不要なコンソール出力を減らすため、werkzeugのログレベルをWARNINGに設定
         log = logging.getLogger('werkzeug')

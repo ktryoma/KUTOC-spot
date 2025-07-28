@@ -1026,17 +1026,18 @@ class CommandProcess():
         self.web_server.log_event("命令受理: ドックを探す")
         # self._navigate_to_unique_position()
         self._navigate_to_first_position()
-        time.sleep(1.0)
+        time.sleep(.5)
         dock_id = 520
         blocking_go_to_prep_pose(self.robot, dock_id)
-        time.sleep(1.0)
+        time.sleep(.5)
         blocking_dock_robot(self.robot, dock_id)
         print("docking success")
         self.web_server.log_event("ドッキング成功")
         
     def _spot_memory_truck(self):
         # self.web_server.log_event("命令受理: トラックの位置を記憶")
-        self.rcl._start_recording()
+        # self.rcl._start_recording()
+        self._make_map()
         time.sleep(.5)
         self.rcl._create_default_waypoint()
         time.sleep(.5)
@@ -1134,19 +1135,51 @@ class CommandProcess():
         self.thread_running = False
         
         
-    def _spot_rotate(self):
+    # def _spot_rotate(self):
 
+    #     self.web_server.log_event("命令受理: 回転")
+    #     robot_state = self.robot_state_client.get_robot_state()
+    #     mobility_params = create_mobility_params(0.3, 0.5)
+    #     tag_cmd = RobotCommandBuilder.synchro_trajectory_command_in_body_frame(0, 0, 2* math.pi,
+    #                             robot_state.kinematic_state.transforms_snapshot, mobility_params)
+    #     end_time = 2.0
+    #     if tag_cmd is not None:
+    #         print('executing command')
+    #         self.robot_command_client.robot_command(lease=None, command=tag_cmd,
+    #                                                 end_time_secs=time.time() + end_time)
+
+    def _spot_rotate(self):
+        self.web_server.log_event("命令受理: 回転")
+        
+        rotation_steps = 2
+        rotation_per_step = math.pi  # 90度
+        
+        for i in range(rotation_steps):
+            robot_state = self.robot_state_client.get_robot_state()
+            mobility_params = create_mobility_params(0.3, 0.5)
+            tag_cmd = RobotCommandBuilder.synchro_trajectory_command_in_body_frame(
+                0, 0, rotation_per_step,
+                robot_state.kinematic_state.transforms_snapshot, mobility_params)
+
+            end_time = 6.3
+            if tag_cmd is not None:
+                print(f'executing rotation step {i+1}/{rotation_steps}')
+                self.robot_command_client.robot_command(lease=None, command=tag_cmd,
+                                                    end_time_secs=time.time() + end_time)
+                time.sleep(end_time + 0.5)  # 各ステップの完了を待つ
+                
+    def _spot_rotate_90(self):
         self.web_server.log_event("命令受理: 回転")
         robot_state = self.robot_state_client.get_robot_state()
         mobility_params = create_mobility_params(0.3, 0.5)
-        tag_cmd = RobotCommandBuilder.synchro_trajectory_command_in_body_frame(0, 0, 2* math.pi,
+        tag_cmd = RobotCommandBuilder.synchro_trajectory_command_in_body_frame(0, 0, math.pi/2,
                                 robot_state.kinematic_state.transforms_snapshot, mobility_params)
-        end_time = 2.0
+        end_time = 3.5
         if tag_cmd is not None:
             print('executing command')
             self.robot_command_client.robot_command(lease=None, command=tag_cmd,
                                                     end_time_secs=time.time() + end_time)
-        
+            
     def _go_to_front(self):
         global PROCESS_THREAD
         # engine.say("go to front")
@@ -1439,6 +1472,60 @@ class CommandProcess():
                         params=spot_command_pb2.MobilityParams(body_control=body_control))
         
         time.sleep(3.0)
+        
+    def _spot_performance_bow(self):
+        self.web_server.log_event("命令受理: パフォーマンス")
+        end_time = 2.0 
+    
+        footprint_R_body = bosdyn.geometry.EulerZXY(yaw=0.4, roll=0.0, pitch=0.0)
+        cmd = RobotCommandBuilder.synchro_stand_command(footprint_R_body=footprint_R_body)
+        self.robot_command_client.robot_command(cmd)
+        time.sleep(1.0)
+        
+        footprint_R_body = geometry.EulerZXY(yaw=0.4, roll=0.0, pitch=-0.3)
+        cmd = RobotCommandBuilder.synchro_stand_command(footprint_R_body=footprint_R_body)
+        self.robot_command_client.robot_command(lease=None, command=cmd, end_time_secs=time.time() + end_time)
+        time.sleep(end_time)
+        
+        footprint_R_body = geometry.EulerZXY(yaw=0.4, roll=0.0, pitch=0.3)
+        cmd = RobotCommandBuilder.synchro_stand_command(footprint_R_body=footprint_R_body)
+        self.robot_command_client.robot_command(lease=None, command=cmd, end_time_secs=time.time() + end_time)
+        time.sleep(end_time)
+        
+        footprint_R_body = geometry.EulerZXY(yaw=-0.4, roll=0.0, pitch=0.0)
+        cmd = RobotCommandBuilder.synchro_stand_command(footprint_R_body=footprint_R_body)
+        self.robot_command_client.robot_command(lease=None, command=cmd, end_time_secs=time.time() + end_time)
+        time.sleep(1.0)
+        
+        footprint_R_body = geometry.EulerZXY(yaw=-0.4, roll=0.0, pitch=-0.3)
+        cmd = RobotCommandBuilder.synchro_stand_command(footprint_R_body=footprint_R_body)
+        self.robot_command_client.robot_command(lease=None, command=cmd, end_time_secs=time.time() + end_time)
+        time.sleep(end_time)
+        
+        footprint_R_body = geometry.EulerZXY(yaw=-0.4, roll=0.0, pitch=0.3)
+        cmd = RobotCommandBuilder.synchro_stand_command(footprint_R_body=footprint_R_body)
+        self.robot_command_client.robot_command(lease=None, command=cmd, end_time_secs=time.time() + end_time)
+        time.sleep(end_time)
+        
+        footprint_R_body = geometry.EulerZXY(yaw=0.0, roll=0.0, pitch=0.0)
+        cmd = RobotCommandBuilder.synchro_stand_command(footprint_R_body=footprint_R_body)
+        self.robot_command_client.robot_command(lease=None, command=cmd, end_time_secs=time.time() + end_time)
+        time.sleep(1.0)
+        
+        footprint_R_body = geometry.EulerZXY(yaw=0.0, roll=0.0, pitch=-0.3)
+        cmd = RobotCommandBuilder.synchro_stand_command(footprint_R_body=footprint_R_body)
+        self.robot_command_client.robot_command(lease=None, command=cmd, end_time_secs=time.time() + end_time)
+        time.sleep(end_time)
+        
+        footprint_R_body = geometry.EulerZXY(yaw=0.0, roll=0.0, pitch=0.3)
+        cmd = RobotCommandBuilder.synchro_stand_command(footprint_R_body=footprint_R_body)
+        self.robot_command_client.robot_command(lease=None, command=cmd, end_time_secs=time.time() + 6.0)
+        time.sleep(6.0)
+        
+        footprint_R_body = geometry.EulerZXY(yaw=0.0, roll=0.0, pitch=0.0)
+        cmd = RobotCommandBuilder.synchro_stand_command(footprint_R_body=footprint_R_body)
+        self.robot_command_client.robot_command(lease=None, command=cmd, end_time_secs=time.time() + end_time)
+        time.sleep(1.0)
     
     def _spot_thinning_pose(self):
         """Command the robot to thin."""

@@ -19,9 +19,12 @@ def get_command_dict(instance):
         "立って": instance._stand_up,
         "立ち上がって": instance._stand_up,
         "立ち上がれ": instance._stand_up,
-        "お辞儀": instance._spot_bow_pose,
-        "おじぎ": instance._spot_bow_pose,
-        "を辞儀": instance._spot_bow_pose,
+        "お辞儀": instance._spot_performance_bow,
+        "おじぎ": instance._spot_performance_bow,
+        "を辞儀": instance._spot_performance_bow,
+        # "お辞儀": instance._spot_bow_pose,
+        # "おじぎ": instance._spot_bow_pose,
+        # "を辞儀": instance._spot_bow_pose,
         "廃棄": instance._spot_thinning_pose,
         "を廃棄": instance._spot_thinning_pose,
         # "しゃがんで": instance._spot_squat_pose,
@@ -79,9 +82,11 @@ def get_web_commands_dict(instance):
         'back': instance._navigate_to_last_position, # 元の場所に戻る
         'charge': instance._spot_find_dock,  # 充電
         'finish_charge': instance._spot_finish_dock, # 充電終了
-        'forward': instance._go_to_front,  # 前進
-        'backward': instance._go_to_back,  # 後退
+        'forward': instance._go_front_little,  # 前進
+        'backward': instance._go_back_little,  # 後退
         'rotate': instance._spot_rotate,  # 回転
+        'rotate_90': instance._spot_rotate_90,  # 回転
+        'performance': instance._spot_performance_bow,  # パフォーマンス
     }
     
 def get_keyboard_commands_dict(instance):
@@ -96,5 +101,5 @@ def get_keyboard_commands_dict(instance):
         "a": instance._go_left_little,
         "d": instance._go_right_little,
         "s": instance._go_back_little,
-        "reset": instance._reset_audio,  # 新たに「reset」コマンドを追加
+        "v": instance._reset_audio,  # 新たに「reset」コマンドを追加
     }

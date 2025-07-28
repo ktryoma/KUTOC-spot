@@ -72,6 +72,7 @@
       padding: 60px 20px 20px 20px;
       box-sizing: border-box;
       overflow-y: auto;
+      padding-bottom: 40px;
     }
     
     .side-menu.open {
@@ -83,6 +84,11 @@
       margin-bottom: 20px;
       border-bottom: 2px solid #e0c070;
       padding-bottom: 10px;
+      margin-top: 30px;
+    }
+
+    .side-menu h3:first-child {
+      margin-top: 0;
     }
     
     .menu-button {
@@ -96,10 +102,16 @@
       cursor: pointer;
       font-size: 14px;
       transition: background 0.3s;
+      display: block;
+      text-align: center;
     }
     
     .menu-button:hover {
       background: #ffd966;
+    }
+
+    .side-menu::-webkit-scrollbar {
+      width: 6px;
     }
     
     /* オーバーレイ */
@@ -207,11 +219,14 @@
     <button class="menu-button" onclick="executeCommand('forward')">前進</button>
     <button class="menu-button" onclick="executeCommand('backward')">後退</button>
     <button class="menu-button" onclick="executeCommand('rotate')">回転</button>
+    <button class="menu-button" onclick="executeCommand('rotate_90')">90°回転</button>
+    <button class="menu-button" onclick="executeCommand('bow')">お辞儀</button>
+    <button class="menu-button" onclick="executeCommand('performance')">三礼法</button>
+
 
     <h3>システム</h3>
     <button class="menu-button" onclick="executeCommand('docking')">ドッキング</button>
     <button class="menu-button" onclick="executeCommand('undocking')">ドッキング解除</button>
-    <button class="menu-button" onclick="executeCommand('bow')">お辞儀</button>
     <button class="menu-button" onclick="executeCommand('squat')">スクワット</button>
     <button class="menu-button" onclick="executeCommand('lie_down')">伏せる</button>
 
