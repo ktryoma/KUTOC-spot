@@ -2,6 +2,7 @@ import math
 import time
 import datetime
 import os
+import numpy as np
 import cv2
 
 from bosdyn.client.robot_command import RobotCommandBuilder
@@ -21,6 +22,11 @@ class Tracking:
         self.PROCESSED_IMAGE_PATH = PROCESSED_IMAGE_PATH
         if not os.path.exists(self.PROCESSED_IMAGE_PATH):
             os.makedirs(self.PROCESSED_IMAGE_PATH)
+        black_image_path = os.path.join(self.PROCESSED_IMAGE_PATH, "black.jpg")
+        if not os.path.exists(black_image_path):
+            # 画像サイズは 360x640 (高さ×幅)
+            black_img = np.zeros((360, 640, 3), dtype=np.uint8)
+            cv2.imwrite(black_image_path, black_img)
         self.SHUTDOWN_FLAG = SHUTDOWN_FLAG  # This should be set to True to stop the thread
         self.REAL_BIBS_HEIGHT = REAL_BIBS_HEIGHT  # mm, height of the bib in real world
 
@@ -60,13 +66,7 @@ class Tracking:
 
 
     def move_to_position_cmd_make(self, robot, x, l, z, box_width, mobility_params=None):
-        """Commands the robot to move to a specified x, y position with a specified yaw angle.
-        
-        Args:
-            robot: spotのインスタンス
-            x: spotから対象までの向いている方向の距離
-            y: spotから対象までの横方向の距離
-        """
+        """指定した位置に移動するコマンドを作成する"""
         # speedの初期化
         speed = 0.0
 
@@ -209,13 +209,13 @@ class Tracking:
 
     def process_image_thread(self, robot_state_client, robot_command_client):
         last_capture_time = 0  # 2秒に1回更新用のタイムスタンプ
+        tag_cmd = None  # 初期化
         try:
             video_capture = cv2.VideoCapture(self.gstreamer_pipeline(), cv2.CAP_GSTREAMER)
             self.update_robot_state(tracking=True)
             if video_capture.isOpened():
                 print("Video stream is opened")
                 while not self.SHUTDOWN_FLAG.value:
-                    # ...existing code...
                     try:
                         ret_val, frame = video_capture.read()
                         if ret_val:

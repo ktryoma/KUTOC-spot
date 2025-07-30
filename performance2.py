@@ -1795,16 +1795,6 @@ def main():
         print(SAMPLE_RATE)
         rec = KaldiRecognizer(model, SAMPLE_RATE)
         
-        # 生成済みでない場合、黒い画像（640x360）を作成して保存する
-        os.makedirs(PROCESSED_IMAGE_PATH, exist_ok=True)
-        black_image_path = os.path.join(PROCESSED_IMAGE_PATH, "black.jpg")
-        if not os.path.exists(black_image_path):
-            import numpy as np
-            # 画像サイズは 360x640 (高さ×幅)
-            black_img = np.zeros((360, 640, 3), dtype=np.uint8)
-            cv2.imwrite(black_image_path, black_img)
-        
-        
         print("keyboad setting")
         keyboard_queue = queue.Queue()
         key_capture_thread = threading.Thread(target=capture_keyboard_input, args=(keyboard_queue,), daemon=True)
