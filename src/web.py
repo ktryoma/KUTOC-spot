@@ -14,10 +14,11 @@ class WebServer:
     
     def __init__(self, processed_image_path="image"):
         template_folder = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'templates')
+        root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.app = Flask(__name__, template_folder=template_folder)
         self.log_messages = []
         self.current_state = "待機状態"
-        self.processed_image_path = processed_image_path
+        self.processed_image_path = os.path.join(root_dir, processed_image_path)
         self.cp = None  # CommandProcessのインスタンスを保持
         self.command_dict = None
         self.lease = None  # LeaseClientのインスタンスを保持
