@@ -65,7 +65,10 @@ class WebServer:
         @self.app.route("/update")
         def update():
             # 追跡中の場合は最新キャプチャ、そうでなければ黒い画像を返す
-            capture_url = self.get_latest_capture_url() if self.tracking_state else "/captures/black.jpg"
+            # img_path = r"/home/krlab/work/kutoc/image/black.jpg"
+            img_path = r"/captures/black.jpg"
+            # print(f"img_path: {img_path}")
+            capture_url = self.get_latest_capture_url() if self.tracking_state else img_path
             return jsonify(state=self.current_state, logs=self.log_messages, capture=capture_url)
         
         @self.app.route("/command", methods=["POST"])

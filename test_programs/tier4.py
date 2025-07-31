@@ -19,7 +19,7 @@ PROCESSED_IMAGE_PATH = "calc"
 # model = YOLO("best.pt")
 # model = YOLO(r"pt_list\0204_epoch200_batch8.pt")
 # model = YOLO(r"redbibs_0222.pt")
-model = YOLO(r"allbibs_epoch1000_batch16.pt")
+model = YOLO(r"../allbibs_epoch1000_batch16.pt")
 
 
 """ 

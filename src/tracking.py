@@ -19,7 +19,8 @@ class Tracking:
         self.BOX_WIDTH = BOX_WIDTH
         self.BOX_HEIGHT = BOX_HEIGHT
         self.DIRECT_DISTANCE = DIRECT_DISTANCE
-        self.PROCESSED_IMAGE_PATH = PROCESSED_IMAGE_PATH
+        # self.PROCESSED_IMAGE_PATH = PROCESSED_IMAGE_PATH
+        self.PROCESSED_IMAGE_PATH = r"/home/krlab/work/kutoc/image"
         if not os.path.exists(self.PROCESSED_IMAGE_PATH):
             os.makedirs(self.PROCESSED_IMAGE_PATH)
         black_image_path = os.path.join(self.PROCESSED_IMAGE_PATH, "black.jpg")
