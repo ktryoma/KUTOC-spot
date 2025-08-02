@@ -21,12 +21,12 @@ def get_command_dict(instance):
         "立って": instance._stand_up,
         "立ち上がって": instance._stand_up,
         "立ち上がれ": instance._stand_up,
-        "お辞儀": instance._spot_performance_bow,
-        "おじぎ": instance._spot_performance_bow,
-        "を辞儀": instance._spot_performance_bow,
-        # "お辞儀": instance._spot_bow_pose,
-        # "おじぎ": instance._spot_bow_pose,
-        # "を辞儀": instance._spot_bow_pose,
+        # "お辞儀": instance._spot_performance_bow,
+        # "おじぎ": instance._spot_performance_bow,
+        # "を辞儀": instance._spot_performance_bow,
+        "お辞儀": instance._spot_bow_pose,
+        "おじぎ": instance._spot_bow_pose,
+        "を辞儀": instance._spot_bow_pose,
         "廃棄": instance._spot_thinning_pose,
         "を廃棄": instance._spot_thinning_pose,
         # "しゃがんで": instance._spot_squat_pose,
@@ -92,6 +92,7 @@ def get_web_commands_dict(instance):
         'finish_charge': instance._spot_finish_dock, # 充電終了
         'forward': instance._go_front_little,  # 前進
         'backward': instance._go_back_little,  # 後退
+        'upload': instance._map_upload_and_sort,  # アップロード    
         'rotate': instance._spot_rotate,  # 回転
         'rotate_90': instance._spot_rotate_90,  # 回転
         'performance': instance._spot_performance_bow,  # パフォーマンス

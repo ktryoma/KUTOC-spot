@@ -1151,9 +1151,9 @@ class CommandProcess():
     def _spot_rotate(self):
         self.web_server.log_event("命令受理: 回転")
         
-        rotation_steps = 2
-        rotation_per_step = math.pi  # 90度
-        
+        rotation_steps = 5
+        rotation_per_step = 2 * math.pi / rotation_steps  # 90度
+
         for i in range(rotation_steps):
             robot_state = self.robot_state_client.get_robot_state()
             mobility_params = create_mobility_params(0.3, 0.5)
@@ -1161,7 +1161,7 @@ class CommandProcess():
                 0, 0, rotation_per_step,
                 robot_state.kinematic_state.transforms_snapshot, mobility_params)
 
-            end_time = 6.3
+            end_time = (6.3 * 2)/5
             if tag_cmd is not None:
                 print(f'executing rotation step {i+1}/{rotation_steps}')
                 self.robot_command_client.robot_command(lease=None, command=tag_cmd,
